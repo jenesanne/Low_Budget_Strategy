@@ -174,8 +174,9 @@ def index():
     cash = float(account.cash)
     buying_power = float(account.buying_power)
     last_equity = float(account.last_equity)
-    day_pnl = equity - last_equity
-    day_pnl_pct = (day_pnl / last_equity * 100) if last_equity else 0
+
+    # Strategy uses a fixed capital allocation, not the full account
+    capital = config.INITIAL_CAPITAL
 
     pos_data = []
     total_market_value = 0
@@ -199,6 +200,12 @@ def index():
             }
         )
     pos_data.sort(key=lambda x: x["unrealized_pl"], reverse=True)
+
+    # Strategy value = initial capital + unrealised P&L from our positions
+    strategy_value = capital + total_unrealized_pl
+    strategy_cash = capital - total_market_value + total_unrealized_pl
+    day_pnl = equity - last_equity  # approximate from account-level
+    day_pnl_pct = (day_pnl / capital * 100) if capital else 0
 
     # Portfolio allocation for chart
     alloc_labels = [p["symbol"] for p in pos_data]
@@ -234,9 +241,9 @@ def index():
 
     return render_template_string(
         DASHBOARD_HTML,
-        equity=equity,
-        cash=cash,
-        buying_power=buying_power,
+        equity=strategy_value,
+        cash=strategy_cash,
+        capital=capital,
         day_pnl=day_pnl,
         day_pnl_pct=day_pnl_pct,
         total_unrealized_pl=total_unrealized_pl,
@@ -359,8 +366,9 @@ DASHBOARD_HTML = r"""
     <div class="row g-2 mb-3">
       <div class="col-6 col-md-3">
         <div class="stat-card">
-          <div class="stat-label">Equity</div>
+          <div class="stat-label">Strategy Value</div>
           <div class="stat-value">${{ "{:,.2f}".format(equity) }}</div>
+          <div class="stat-label" style="font-size:0.65rem">Capital: ${{ "{:,.0f}".format(capital) }}</div>
         </div>
       </div>
       <div class="col-6 col-md-3">

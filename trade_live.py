@@ -54,7 +54,8 @@ def rebalance():
     # 1. Account equity -------------------------------------------------------
     account = client.get_account()
     equity = float(account.equity)
-    logger.info(f"Account equity: ${equity:,.2f}")
+    capital = config.INITIAL_CAPITAL
+    logger.info(f"Account equity: ${equity:,.2f}  |  Strategy capital: ${capital:,.2f}")
 
     # 2. Score universe -------------------------------------------------------
     tickers = config.UNIVERSE_TICKERS
@@ -83,7 +84,7 @@ def rebalance():
     current = {p.symbol: float(p.qty) for p in positions}
 
     # 4. Calculate target shares (equal-weight, fractional) -------------------
-    target_value = equity / len(target_tickers)
+    target_value = capital / len(target_tickers)
     latest_prices = prices.iloc[-1]
 
     targets: dict[str, float] = {}
