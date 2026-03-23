@@ -68,6 +68,7 @@ def compute_value_score(fundamentals: pd.DataFrame) -> pd.Series:
     Each metric is percentile-ranked and averaged.
     Missing metrics are ignored (scored on available data).
     """
+    fundamentals = fundamentals[~fundamentals.index.duplicated(keep="first")]
     scores = pd.DataFrame(index=fundamentals.index)
 
     for col in ["pe_ratio", "ps_ratio", "ev_ebitda"]:
@@ -113,6 +114,7 @@ def compute_fscore(fundamentals: pd.DataFrame) -> pd.Series:
     with absolute thresholds. Full implementation needs two periods of data.
     """
     df = fundamentals.copy()
+    df = df[~df.index.duplicated(keep="first")]
     score = pd.Series(0, index=df.index, dtype=int)
 
     # 1. ROA > 0
