@@ -21,7 +21,13 @@ load_dotenv()
 import config
 from strategy.alpha_vantage_fetcher import fetch_fundamentals_for_scoring
 from strategy.data_fetcher import fetch_price_data
-from strategy.scoring import compute_composite_score, select_portfolio
+from strategy.scoring import (
+    compute_composite_score,
+    compute_fscore,
+    compute_momentum_score,
+    compute_value_score,
+    select_portfolio,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,8 +65,11 @@ def rebalance():
     fundamentals = fetch_fundamentals_for_scoring(tickers)
 
     logger.info("Computing composite scores ...")
-    scores = compute_composite_score(prices, fundamentals)
-    portfolio = select_portfolio(scores, prices)
+    momentum = compute_momentum_score(prices)
+    value = compute_value_score(fundamentals)
+    fscore = compute_fscore(fundamentals)
+    scores = compute_composite_score(momentum, value, fscore)
+    portfolio = select_portfolio(scores)
 
     if portfolio.empty:
         logger.warning("No stocks passed scoring. Exiting without trading.")
@@ -85,8 +94,8 @@ def rebalance():
                 targets[ticker] = round(target_value / price, 4)
 
     # 5. Compute deltas -------------------------------------------------------
-    from alpaca.trading.requests import MarketOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
 
     sells = []
     buys = []
@@ -136,9 +145,7 @@ def rebalance():
         except Exception as e:
             logger.error(f"Order failed for {ticker}: {e}")
 
-    logger.info(
-        f"Rebalance complete. {submitted}/{len(all_orders)} orders submitted."
-    )
+    logger.info(f"Rebalance complete. {submitted}/{len(all_orders)} orders submitted.")
 
 
 if __name__ == "__main__":
