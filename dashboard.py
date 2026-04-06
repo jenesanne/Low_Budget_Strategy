@@ -17,6 +17,8 @@ import logging
 import math
 import os
 import secrets
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -462,6 +464,17 @@ def backtest():
         annual_returns=json.dumps(metrics.get("annual_returns", {})),
         env=config.ALPACA_ENVIRONMENT.upper(),
         now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        # Config params for tuning panel
+        cfg_stop_loss=config.STOP_LOSS_PCT,
+        cfg_trailing_stop=config.TRAILING_STOP,
+        cfg_momentum_weight=config.MOMENTUM_WEIGHT,
+        cfg_value_weight=config.VALUE_WEIGHT,
+        cfg_fscore_weight=config.FSCORE_WEIGHT,
+        cfg_min_fscore=config.MIN_FSCORE,
+        cfg_max_positions=config.MAX_POSITIONS,
+        cfg_rebalance_frequency=config.REBALANCE_FREQUENCY,
+        cfg_use_regime_filter=config.USE_REGIME_FILTER,
+        cfg_momentum_lookback=config.MOMENTUM_LOOKBACK,
     )
 
 
@@ -484,6 +497,186 @@ def api_backtest_equity():
         drawdowns.append(round((v - peak) / peak * 100, 2) if peak > 0 else 0)
 
     return jsonify({"dates": dates, "values": values, "drawdowns": drawdowns})
+
+
+# ── Backtest Runner (background thread) ─────────────────────────────────────
+
+_backtest_state = {
+    "running": False,
+    "progress": "",
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "params": {},
+}
+_backtest_lock = threading.Lock()
+
+
+def _run_backtest_thread(params):
+    """Run zipline backtest in background with overridden config params."""
+
+    import pandas as pd
+
+    from strategy.alpha_vantage_fetcher import (
+        fetch_fundamentals_for_scoring,
+        fetch_historical_fundamentals,
+    )
+    from strategy.data_fetcher import fetch_price_data
+    from strategy.zipline_backtester import run_zipline_backtest
+
+    try:
+        with _backtest_lock:
+            _backtest_state["progress"] = "Loading price data..."
+
+        # Temporarily override config values
+        original_values = {}
+        param_map = {
+            "stop_loss_pct": ("STOP_LOSS_PCT", float),
+            "trailing_stop": ("TRAILING_STOP", lambda v: v == "true"),
+            "momentum_weight": ("MOMENTUM_WEIGHT", float),
+            "value_weight": ("VALUE_WEIGHT", float),
+            "fscore_weight": ("FSCORE_WEIGHT", float),
+            "min_fscore": ("MIN_FSCORE", int),
+            "max_positions": ("MAX_POSITIONS", int),
+            "rebalance_frequency": ("REBALANCE_FREQUENCY", str),
+            "use_regime_filter": ("USE_REGIME_FILTER", lambda v: v == "true"),
+            "momentum_lookback": ("MOMENTUM_LOOKBACK", int),
+        }
+        for form_key, (config_attr, converter) in param_map.items():
+            if form_key in params and params[form_key] != "":
+                original_values[config_attr] = getattr(config, config_attr)
+                setattr(config, config_attr, converter(params[form_key]))
+
+        tickers = config.UNIVERSE_TICKERS
+        regime_ticker = getattr(config, "REGIME_TICKER", None)
+        if regime_ticker and regime_ticker not in tickers:
+            tickers = tickers + [regime_ticker]
+
+        prices = fetch_price_data(tickers)
+        if prices.empty:
+            raise RuntimeError("No price data retrieved — check API keys")
+
+        with _backtest_lock:
+            _backtest_state["progress"] = (
+                f"Loaded {prices.shape[1]} tickers, {prices.shape[0]} days. Fetching fundamentals..."
+            )
+
+        scoring_tickers = [
+            t for t in prices.columns if t != getattr(config, "REGIME_TICKER", "SPY")
+        ]
+        _ = fetch_fundamentals_for_scoring(scoring_tickers)
+        fundamentals = fetch_historical_fundamentals(scoring_tickers)
+        if not fundamentals:
+            fundamentals = fetch_fundamentals_for_scoring(scoring_tickers)
+            if isinstance(fundamentals, pd.DataFrame) and fundamentals.empty:
+                fundamentals = None
+
+        with _backtest_lock:
+            _backtest_state["progress"] = "Running Zipline backtest..."
+
+        benchmark_prices = fetch_price_data(
+            [config.BENCHMARK_TICKER],
+            start=config.BACKTEST_START,
+            end=config.BACKTEST_END,
+        )
+        bench_series = None
+        if (
+            not benchmark_prices.empty
+            and config.BENCHMARK_TICKER in benchmark_prices.columns
+        ):
+            bench_series = benchmark_prices[config.BENCHMARK_TICKER]
+
+        results = run_zipline_backtest(
+            prices,
+            fundamentals=fundamentals,
+            benchmark_prices=bench_series,
+            initial_capital=config.INITIAL_CAPITAL,
+        )
+
+        with _backtest_lock:
+            _backtest_state["progress"] = "Saving results..."
+
+        if results["trades"] is not None and len(results["trades"]) > 0:
+            results["trades"].to_csv("output/zipline_trades.csv", index=False)
+        results["equity_curve"].to_csv("output/zipline_equity.csv")
+
+        with _backtest_lock:
+            _backtest_state["running"] = False
+            _backtest_state["finished_at"] = time.time()
+            _backtest_state["progress"] = "Complete"
+            _backtest_state["error"] = None
+
+    except Exception as e:
+        logger.exception("Backtest failed")
+        with _backtest_lock:
+            _backtest_state["running"] = False
+            _backtest_state["finished_at"] = time.time()
+            _backtest_state["error"] = str(e)
+            _backtest_state["progress"] = "Failed"
+    finally:
+        # Restore original config values
+        for config_attr, original_val in original_values.items():
+            setattr(config, config_attr, original_val)
+
+
+@app.route("/backtest/run", methods=["POST"])
+def backtest_run():
+    if _requires_auth():
+        return jsonify({"error": "unauthorized"}), 401
+
+    with _backtest_lock:
+        if _backtest_state["running"]:
+            return jsonify({"error": "Backtest already running"}), 409
+
+    # Collect parameters from form
+    params = {}
+    for key in [
+        "stop_loss_pct",
+        "trailing_stop",
+        "momentum_weight",
+        "value_weight",
+        "fscore_weight",
+        "min_fscore",
+        "max_positions",
+        "rebalance_frequency",
+        "use_regime_filter",
+        "momentum_lookback",
+    ]:
+        val = request.form.get(key, "")
+        if val != "":
+            params[key] = val
+
+    with _backtest_lock:
+        _backtest_state["running"] = True
+        _backtest_state["started_at"] = time.time()
+        _backtest_state["finished_at"] = None
+        _backtest_state["error"] = None
+        _backtest_state["progress"] = "Starting..."
+        _backtest_state["params"] = params
+
+    thread = threading.Thread(target=_run_backtest_thread, args=(params,), daemon=True)
+    thread.start()
+
+    return jsonify({"status": "started", "params": params})
+
+
+@app.route("/api/backtest-status")
+def api_backtest_status():
+    if _requires_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    with _backtest_lock:
+        elapsed = None
+        if _backtest_state["started_at"]:
+            end = _backtest_state["finished_at"] or time.time()
+            elapsed = round(end - _backtest_state["started_at"], 1)
+        return jsonify(
+            {
+                "running": _backtest_state["running"],
+                "progress": _backtest_state["progress"],
+                "error": _backtest_state["error"],
+                "elapsed_seconds": elapsed,
+            }
+        )
 
 
 # ── HTML Templates ──────────────────────────────────────────────────────────
@@ -855,6 +1048,20 @@ BACKTEST_HTML = r"""
     .metric-name { color: #8b949e; font-size: 0.85rem; }
     .metric-val { font-weight: 600; font-size: 0.85rem; }
     @media (max-width: 576px) { .stat-value { font-size: 1.2rem; } .chart-container { height: 220px; } }
+    .param-input { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px;
+                   padding: 0.3rem 0.5rem; font-size: 0.8rem; width: 100%; }
+    .param-input:focus { border-color: var(--accent); outline: none; }
+    .param-label { color: #8b949e; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.2rem; }
+    .param-select { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px;
+                    padding: 0.3rem 0.5rem; font-size: 0.8rem; width: 100%; }
+    .run-btn { background: var(--accent); color: #0d1117; border: none; font-weight: 700; border-radius: 8px; padding: 0.5rem 1.5rem; }
+    .run-btn:hover { background: #00b894; color: #0d1117; }
+    .run-btn:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+    #runStatus { font-size: 0.8rem; }
+    .spinner-border-sm { width: 1rem; height: 1rem; border-width: 0.15em; }
+    .collapse-toggle { cursor: pointer; user-select: none; }
+    .collapse-toggle i { transition: transform 0.2s; }
+    .collapse-toggle.collapsed i { transform: rotate(-90deg); }
   </style>
 </head>
 <body>
@@ -879,6 +1086,84 @@ BACKTEST_HTML = r"""
       <a href="/backtest" class="nav-link-custom active pb-2">
         <i class="bi bi-bar-chart-line"></i> Backtest
       </a>
+    </div>
+
+    <!-- Parameter Tuning Panel -->
+    <div class="stat-card mb-3">
+      <div class="d-flex justify-content-between align-items-center collapse-toggle" data-bs-toggle="collapse" data-bs-target="#tuningPanel">
+        <div class="stat-label mb-0"><i class="bi bi-sliders"></i> Strategy Parameters</div>
+        <i class="bi bi-chevron-down" style="color:#8b949e; font-size:0.8rem"></i>
+      </div>
+      <div class="collapse" id="tuningPanel">
+        <form id="backtestForm" class="mt-3">
+          <div class="row g-2 mb-2">
+            <div class="col-6 col-md-3">
+              <div class="param-label">Stop Loss %</div>
+              <input type="number" name="stop_loss_pct" class="param-input" step="0.05"
+                     value="{{ cfg_stop_loss }}" min="-0.80" max="-0.05">
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="param-label">Trailing Stop</div>
+              <select name="trailing_stop" class="param-select">
+                <option value="true" {{ 'selected' if cfg_trailing_stop else '' }}>Trailing (from peak)</option>
+                <option value="false" {{ 'selected' if not cfg_trailing_stop else '' }}>Fixed (from entry)</option>
+              </select>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="param-label">Max Positions</div>
+              <input type="number" name="max_positions" class="param-input"
+                     value="{{ cfg_max_positions }}" min="3" max="20">
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="param-label">Rebalance</div>
+              <select name="rebalance_frequency" class="param-select">
+                <option value="monthly" {{ 'selected' if cfg_rebalance_frequency == 'monthly' else '' }}>Monthly</option>
+                <option value="quarterly" {{ 'selected' if cfg_rebalance_frequency == 'quarterly' else '' }}>Quarterly</option>
+              </select>
+            </div>
+          </div>
+          <div class="row g-2 mb-2">
+            <div class="col-4 col-md-2">
+              <div class="param-label">Momentum Wt</div>
+              <input type="number" name="momentum_weight" class="param-input" step="0.05"
+                     value="{{ cfg_momentum_weight }}" min="0" max="1">
+            </div>
+            <div class="col-4 col-md-2">
+              <div class="param-label">Value Wt</div>
+              <input type="number" name="value_weight" class="param-input" step="0.05"
+                     value="{{ cfg_value_weight }}" min="0" max="1">
+            </div>
+            <div class="col-4 col-md-2">
+              <div class="param-label">F-Score Wt</div>
+              <input type="number" name="fscore_weight" class="param-input" step="0.05"
+                     value="{{ cfg_fscore_weight }}" min="0" max="1">
+            </div>
+            <div class="col-4 col-md-2">
+              <div class="param-label">Min F-Score</div>
+              <input type="number" name="min_fscore" class="param-input"
+                     value="{{ cfg_min_fscore }}" min="0" max="9">
+            </div>
+            <div class="col-4 col-md-2">
+              <div class="param-label">Momentum Lookback</div>
+              <input type="number" name="momentum_lookback" class="param-input"
+                     value="{{ cfg_momentum_lookback }}" min="21" max="252">
+            </div>
+            <div class="col-4 col-md-2">
+              <div class="param-label">Regime Filter</div>
+              <select name="use_regime_filter" class="param-select">
+                <option value="true" {{ 'selected' if cfg_use_regime_filter else '' }}>On (SPY>200MA)</option>
+                <option value="false" {{ 'selected' if not cfg_use_regime_filter else '' }}>Off</option>
+              </select>
+            </div>
+          </div>
+          <div class="d-flex align-items-center gap-3 mt-2">
+            <button type="submit" class="run-btn" id="runBtn">
+              <i class="bi bi-play-fill"></i> Run Backtest
+            </button>
+            <span id="runStatus"></span>
+          </div>
+        </form>
+      </div>
     </div>
 
     <!-- Top Metrics Row -->
@@ -1164,7 +1449,60 @@ BACKTEST_HTML = r"""
         }
       });
     }
+
+    // ── Run Backtest form ──────────────────────────────────────────────
+    const form = document.getElementById('backtestForm');
+    const runBtn = document.getElementById('runBtn');
+    const runStatus = document.getElementById('runStatus');
+
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      runBtn.disabled = true;
+      runBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Running...';
+      runStatus.innerHTML = '<span class="text-muted">Starting backtest...</span>';
+
+      const formData = new FormData(form);
+
+      fetch('/backtest/run', { method: 'POST', body: formData })
+        .then(r => r.json())
+        .then(data => {
+          if (data.error) {
+            runStatus.innerHTML = '<span class="loss">' + data.error + '</span>';
+            runBtn.disabled = false;
+            runBtn.innerHTML = '<i class="bi bi-play-fill"></i> Run Backtest';
+            return;
+          }
+          // Start polling for status
+          pollStatus();
+        })
+        .catch(err => {
+          runStatus.innerHTML = '<span class="loss">Request failed</span>';
+          runBtn.disabled = false;
+          runBtn.innerHTML = '<i class="bi bi-play-fill"></i> Run Backtest';
+        });
+    });
+
+    function pollStatus() {
+      fetch('/api/backtest-status')
+        .then(r => r.json())
+        .then(data => {
+          const elapsed = data.elapsed_seconds ? data.elapsed_seconds.toFixed(0) + 's' : '';
+          if (data.running) {
+            runStatus.innerHTML = '<span class="text-muted">' + data.progress + ' (' + elapsed + ')</span>';
+            setTimeout(pollStatus, 2000);
+          } else if (data.error) {
+            runStatus.innerHTML = '<span class="loss"><i class="bi bi-x-circle"></i> ' + data.error + '</span>';
+            runBtn.disabled = false;
+            runBtn.innerHTML = '<i class="bi bi-play-fill"></i> Run Backtest';
+          } else {
+            runStatus.innerHTML = '<span class="gain"><i class="bi bi-check-circle"></i> Done in ' + elapsed + ' — reloading...</span>';
+            setTimeout(() => location.reload(), 1500);
+          }
+        })
+        .catch(() => setTimeout(pollStatus, 3000));
+    }
   </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 """
