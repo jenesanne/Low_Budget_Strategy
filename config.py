@@ -52,7 +52,8 @@ FSCORE_WEIGHT = 0.40  # Weight in composite score
 MIN_FSCORE = 5  # Quality filter — only fundamentally sound companies
 
 # ── Risk Management & Execution ─────────────────────────────────────────────
-STOP_LOSS_PCT = -0.25  # -25% hard stop loss
+STOP_LOSS_PCT = -0.25  # -25% trailing stop (from peak price, not entry)
+TRAILING_STOP = True  # True = trail from high-water mark; False = fixed from entry
 HYSTERESIS_RANK = 30  # Only sell if stock drops below this rank
 TRADING_COST_PCT = 0.0025  # 0.25% estimated round-trip spread cost
 # Dynamic slippage: additional cost as a function of volatility and dollar volume

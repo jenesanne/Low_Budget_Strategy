@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import logging
+import math
 import os
 import secrets
 from datetime import datetime, timezone
@@ -274,6 +276,216 @@ def api_equity_history():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Backtest Helpers ────────────────────────────────────────────────────────
+
+OUTPUT_DIR = Path(__file__).parent / "output"
+
+
+def _load_backtest_equity():
+    """Load zipline equity curve CSV into list of (date_str, value) tuples."""
+    path = OUTPUT_DIR / "zipline_equity.csv"
+    if not path.exists():
+        return []
+    rows = []
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append((row["date"][:10], float(row["value"])))
+    return rows
+
+
+def _load_backtest_trades():
+    """Load zipline trades CSV."""
+    path = OUTPUT_DIR / "zipline_trades.csv"
+    if not path.exists():
+        return []
+    rows = []
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(
+                {
+                    "date": row["date"][:10],
+                    "ticker": row["ticker"],
+                    "action": row["action"],
+                    "shares": round(float(row["shares"]), 2),
+                    "fill_price": round(float(row["fill_price"]), 2),
+                    "market_price": round(float(row["market_price"]), 2),
+                    "slippage_cost": round(float(row["slippage_cost"]), 4),
+                    "commission": round(float(row["commission"]), 4),
+                    "value": round(float(row["value"]), 2),
+                }
+            )
+    return rows
+
+
+def _compute_backtest_metrics(equity_rows):
+    """Compute performance metrics from equity time series."""
+    if len(equity_rows) < 2:
+        return {}
+
+    values = [v for _, v in equity_rows]
+    initial = values[0]
+    final = values[-1]
+
+    # Daily returns
+    returns = []
+    for i in range(1, len(values)):
+        if values[i - 1] > 0:
+            returns.append(values[i] / values[i - 1] - 1)
+
+    if not returns:
+        return {}
+
+    total_return = final / initial - 1
+
+    # Parse dates for CAGR
+    first_date = datetime.strptime(equity_rows[0][0], "%Y-%m-%d")
+    last_date = datetime.strptime(equity_rows[-1][0], "%Y-%m-%d")
+    n_years = max((last_date - first_date).days / 365.25, 0.01)
+    cagr = (1 + total_return) ** (1 / n_years) - 1
+
+    # Volatility
+    avg_ret = sum(returns) / len(returns)
+    var = sum((r - avg_ret) ** 2 for r in returns) / len(returns)
+    daily_vol = math.sqrt(var)
+    annual_vol = daily_vol * math.sqrt(252)
+
+    # Sharpe
+    risk_free_daily = getattr(config, "RISK_FREE_RATE", 0.05) / 252
+    excess = [r - risk_free_daily for r in returns]
+    avg_excess = sum(excess) / len(excess)
+    sharpe = (avg_excess / daily_vol * math.sqrt(252)) if daily_vol > 0 else 0
+
+    # Sortino
+    downside = [r for r in returns if r < 0]
+    if downside:
+        down_var = sum(r**2 for r in downside) / len(downside)
+        down_vol = math.sqrt(down_var) * math.sqrt(252)
+        sortino = (
+            (avg_ret * 252 - getattr(config, "RISK_FREE_RATE", 0.05)) / down_vol
+            if down_vol > 0
+            else 0
+        )
+    else:
+        sortino = 0
+
+    # Drawdown
+    peak = values[0]
+    max_dd = 0
+    drawdowns = []
+    for v in values:
+        if v > peak:
+            peak = v
+        dd = (v - peak) / peak if peak > 0 else 0
+        drawdowns.append(dd)
+        if dd < max_dd:
+            max_dd = dd
+
+    # Calmar
+    calmar = (cagr / abs(max_dd)) if max_dd != 0 else 0
+
+    # Win rate
+    win_days = sum(1 for r in returns if r > 0)
+    win_rate = win_days / len(returns) if returns else 0
+
+    # Best / worst
+    best_day = max(returns)
+    worst_day = min(returns)
+
+    # Annual returns
+    annual = {}
+    for date_str, val in equity_rows:
+        year = int(date_str[:4])
+        if year not in annual:
+            annual[year] = {"first": val, "last": val}
+        annual[year]["last"] = val
+    annual_returns = {}
+    years_sorted = sorted(annual.keys())
+    for i, y in enumerate(years_sorted):
+        start_val = annual[y]["first"]
+        if i > 0:
+            prev_year = years_sorted[i - 1]
+            start_val = annual[prev_year]["last"]
+        annual_returns[y] = annual[y]["last"] / start_val - 1 if start_val > 0 else 0
+
+    return {
+        "total_return": total_return,
+        "cagr": cagr,
+        "volatility": annual_vol,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": max_dd,
+        "calmar": calmar,
+        "win_rate": win_rate,
+        "best_day": best_day,
+        "worst_day": worst_day,
+        "n_days": len(returns),
+        "initial_capital": values[0],
+        "final_value": values[-1],
+        "annual_returns": annual_returns,
+        "drawdowns": drawdowns,
+    }
+
+
+# ── Backtest Routes ─────────────────────────────────────────────────────────
+
+
+@app.route("/backtest")
+def backtest():
+    if _requires_auth():
+        return redirect(url_for("login"))
+
+    equity_rows = _load_backtest_equity()
+    trades = _load_backtest_trades()
+    metrics = _compute_backtest_metrics(equity_rows)
+
+    if not equity_rows:
+        return render_template_string(
+            ERROR_HTML,
+            error="No backtest data found. Run: python main.py zipline-backtest",
+        )
+
+    # Trade summary stats
+    buys = [t for t in trades if t["action"] == "BUY"]
+    sells = [t for t in trades if t["action"] == "SELL"]
+    total_slippage = sum(t["slippage_cost"] for t in trades)
+
+    return render_template_string(
+        BACKTEST_HTML,
+        metrics=metrics,
+        trades=trades[-50:],  # last 50 trades
+        total_trades=len(trades),
+        total_buys=len(buys),
+        total_sells=len(sells),
+        total_slippage=total_slippage,
+        annual_returns=json.dumps(metrics.get("annual_returns", {})),
+        env=config.ALPACA_ENVIRONMENT.upper(),
+        now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    )
+
+
+@app.route("/api/backtest-equity")
+def api_backtest_equity():
+    if _requires_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    equity_rows = _load_backtest_equity()
+    if not equity_rows:
+        return jsonify({"error": "no data"}), 404
+    dates = [r[0] for r in equity_rows]
+    values = [r[1] for r in equity_rows]
+
+    # Drawdown series
+    peak = values[0]
+    drawdowns = []
+    for v in values:
+        if v > peak:
+            peak = v
+        drawdowns.append(round((v - peak) / peak * 100, 2) if peak > 0 else 0)
+
+    return jsonify({"dates": dates, "values": values, "drawdowns": drawdowns})
+
+
 # ── HTML Templates ──────────────────────────────────────────────────────────
 
 LOGIN_HTML = """
@@ -345,6 +557,9 @@ DASHBOARD_HTML = r"""
     .mini-chart { height: 200px; }
     @media (max-width: 576px) { .stat-value { font-size: 1.2rem; } }
     .refresh-btn { position: fixed; bottom: 1rem; right: 1rem; z-index: 100; border-radius: 50%; width: 48px; height: 48px; }
+    .nav-link-custom { color: #8b949e; text-decoration: none; font-size: 0.85rem; }
+    .nav-link-custom:hover { color: var(--accent); }
+    .nav-link-custom.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
   </style>
 </head>
 <body>
@@ -360,6 +575,16 @@ DASHBOARD_HTML = r"""
         <small class="text-muted">{{ now }}</small>
       </div>
       <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-clockwise"></i></a>
+    </div>
+
+    <!-- Nav -->
+    <div class="d-flex gap-3 mb-3 border-bottom" style="border-color:#30363d!important">
+      <a href="/" class="nav-link-custom active pb-2">
+        <i class="bi bi-speedometer2"></i> Dashboard
+      </a>
+      <a href="/backtest" class="nav-link-custom pb-2">
+        <i class="bi bi-bar-chart-line"></i> Backtest
+      </a>
     </div>
 
     <!-- Account Stats -->
@@ -590,6 +815,355 @@ DASHBOARD_HTML = r"""
 
     // Auto-refresh every 60s
     setTimeout(() => location.reload(), 60000);
+  </script>
+</body>
+</html>
+"""
+
+BACKTEST_HTML = r"""
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Backtest — Low-Budget Strategy</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --accent: #00d4aa; }
+    body { background: #0d1117; font-family: -apple-system, system-ui, sans-serif; }
+    .stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 1rem; }
+    .stat-value { font-size: 1.5rem; font-weight: 700; }
+    .stat-label { color: #8b949e; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .gain { color: #3fb950; }
+    .loss { color: #f85149; }
+    .neutral { color: #8b949e; }
+    .badge-env { background: #1f6feb; font-size: 0.7rem; vertical-align: middle; }
+    .table { font-size: 0.85rem; }
+    .table th { color: #8b949e; font-weight: 600; border-color: #30363d; }
+    .table td { border-color: #21262d; vertical-align: middle; }
+    .order-buy { color: #3fb950; }
+    .order-sell { color: #f85149; }
+    .chart-container { height: 300px; }
+    .chart-sm { height: 180px; }
+    .nav-link-custom { color: #8b949e; text-decoration: none; font-size: 0.85rem; }
+    .nav-link-custom:hover { color: var(--accent); }
+    .nav-link-custom.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+    .metric-row { display: flex; justify-content: space-between; padding: 0.4rem 0; border-bottom: 1px solid #21262d; }
+    .metric-row:last-child { border-bottom: none; }
+    .metric-name { color: #8b949e; font-size: 0.85rem; }
+    .metric-val { font-weight: 600; font-size: 0.85rem; }
+    @media (max-width: 576px) { .stat-value { font-size: 1.2rem; } .chart-container { height: 220px; } }
+  </style>
+</head>
+<body>
+  <div class="container-fluid py-3 px-3">
+    <!-- Header -->
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div>
+        <h5 class="mb-0">
+          <i class="bi bi-lightning-charge" style="color:var(--accent)"></i>
+          Low-Budget Strategy
+          <span class="badge badge-env ms-1">{{ env }}</span>
+        </h5>
+        <small class="text-muted">{{ now }}</small>
+      </div>
+    </div>
+
+    <!-- Nav -->
+    <div class="d-flex gap-3 mb-3 border-bottom" style="border-color:#30363d!important">
+      <a href="/" class="nav-link-custom pb-2">
+        <i class="bi bi-speedometer2"></i> Dashboard
+      </a>
+      <a href="/backtest" class="nav-link-custom active pb-2">
+        <i class="bi bi-bar-chart-line"></i> Backtest
+      </a>
+    </div>
+
+    <!-- Top Metrics Row -->
+    <div class="row g-2 mb-3">
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Total Return</div>
+          <div class="stat-value {{ 'gain' if metrics.total_return >= 0 else 'loss' }}">
+            {{ "{:+.1%}".format(metrics.total_return) }}
+          </div>
+          <div class="stat-label" style="font-size:0.65rem">
+            ${{ "{:,.2f}".format(metrics.initial_capital) }} → ${{ "{:,.2f}".format(metrics.final_value) }}
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">CAGR</div>
+          <div class="stat-value {{ 'gain' if metrics.cagr >= 0 else 'loss' }}">
+            {{ "{:+.1%}".format(metrics.cagr) }}
+          </div>
+          <div class="stat-label" style="font-size:0.65rem">{{ metrics.n_days }} trading days</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Max Drawdown</div>
+          <div class="stat-value loss">
+            {{ "{:.1%}".format(metrics.max_drawdown) }}
+          </div>
+          <div class="stat-label" style="font-size:0.65rem">Calmar: {{ "{:.2f}".format(metrics.calmar) }}</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Sharpe Ratio</div>
+          <div class="stat-value {{ 'gain' if metrics.sharpe > 0 else 'loss' }}">
+            {{ "{:.2f}".format(metrics.sharpe) }}
+          </div>
+          <div class="stat-label" style="font-size:0.65rem">Sortino: {{ "{:.2f}".format(metrics.sortino) }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Equity Curve + Drawdown -->
+    <div class="row g-2 mb-3">
+      <div class="col-12">
+        <div class="stat-card">
+          <div class="stat-label mb-2"><i class="bi bi-graph-up"></i> Equity Curve</div>
+          <div class="chart-container">
+            <canvas id="equityChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="row g-2 mb-3">
+      <div class="col-12">
+        <div class="stat-card">
+          <div class="stat-label mb-2"><i class="bi bi-graph-down"></i> Drawdown</div>
+          <div class="chart-sm">
+            <canvas id="drawdownChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Detailed Metrics + Annual Returns -->
+    <div class="row g-2 mb-3">
+      <div class="col-md-6">
+        <div class="stat-card">
+          <div class="stat-label mb-2"><i class="bi bi-clipboard-data"></i> Performance Metrics</div>
+          <div class="metric-row">
+            <span class="metric-name">Annualized Volatility</span>
+            <span class="metric-val">{{ "{:.1%}".format(metrics.volatility) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Sharpe Ratio</span>
+            <span class="metric-val {{ 'gain' if metrics.sharpe > 0 else 'loss' }}">{{ "{:.2f}".format(metrics.sharpe) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Sortino Ratio</span>
+            <span class="metric-val {{ 'gain' if metrics.sortino > 0 else 'loss' }}">{{ "{:.2f}".format(metrics.sortino) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Calmar Ratio</span>
+            <span class="metric-val {{ 'gain' if metrics.calmar > 0 else 'loss' }}">{{ "{:.2f}".format(metrics.calmar) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Max Drawdown</span>
+            <span class="metric-val loss">{{ "{:.1%}".format(metrics.max_drawdown) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Win Rate (Daily)</span>
+            <span class="metric-val">{{ "{:.1%}".format(metrics.win_rate) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Best Day</span>
+            <span class="metric-val gain">{{ "{:+.2%}".format(metrics.best_day) }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Worst Day</span>
+            <span class="metric-val loss">{{ "{:+.2%}".format(metrics.worst_day) }}</span>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="stat-card">
+          <div class="stat-label mb-2"><i class="bi bi-calendar3"></i> Annual Returns</div>
+          <div class="chart-sm">
+            <canvas id="annualChart"></canvas>
+          </div>
+        </div>
+        <div class="stat-card mt-2">
+          <div class="stat-label mb-2"><i class="bi bi-arrow-left-right"></i> Execution Stats</div>
+          <div class="metric-row">
+            <span class="metric-name">Total Trades</span>
+            <span class="metric-val">{{ total_trades }}</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Buys / Sells</span>
+            <span class="metric-val"><span class="gain">{{ total_buys }}</span> / <span class="loss">{{ total_sells }}</span></span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-name">Total Slippage</span>
+            <span class="metric-val loss">${{ "{:,.2f}".format(total_slippage) }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Trades Table -->
+    <div class="stat-card mb-5">
+      <div class="stat-label mb-2"><i class="bi bi-receipt"></i> Recent Trades (last 50 of {{ total_trades }})</div>
+      {% if trades %}
+      <div class="table-responsive">
+        <table class="table table-sm mb-0">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Ticker</th>
+              <th>Side</th>
+              <th class="text-end">Shares</th>
+              <th class="text-end">Fill Price</th>
+              <th class="text-end d-none d-sm-table-cell">Mkt Price</th>
+              <th class="text-end d-none d-md-table-cell">Slippage</th>
+              <th class="text-end">Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for t in trades | reverse %}
+            <tr>
+              <td class="text-muted" style="font-size:0.75rem">{{ t.date }}</td>
+              <td class="fw-bold">{{ t.ticker }}</td>
+              <td class="{{ 'order-buy' if t.action == 'BUY' else 'order-sell' }}">{{ t.action }}</td>
+              <td class="text-end">{{ t.shares }}</td>
+              <td class="text-end">${{ "{:.2f}".format(t.fill_price) }}</td>
+              <td class="text-end d-none d-sm-table-cell">${{ "{:.2f}".format(t.market_price) }}</td>
+              <td class="text-end d-none d-md-table-cell loss">${{ "{:.4f}".format(t.slippage_cost) }}</td>
+              <td class="text-end">${{ "{:,.2f}".format(t.value) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-muted mb-0">No trades recorded.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <script>
+    // Fetch equity + drawdown data
+    fetch('/api/backtest-equity')
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) return;
+
+        // Equity Chart
+        new Chart(document.getElementById('equityChart'), {
+          type: 'line',
+          data: {
+            labels: data.dates,
+            datasets: [{
+              label: 'Portfolio',
+              data: data.values,
+              borderColor: '#00d4aa',
+              backgroundColor: 'rgba(0,212,170,0.08)',
+              fill: true,
+              tension: 0.2,
+              pointRadius: 0,
+              borderWidth: 2,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  label: ctx => '$' + ctx.parsed.y.toLocaleString(undefined, {minimumFractionDigits: 2})
+                }
+              }
+            },
+            scales: {
+              x: { display: true, grid: { color: '#21262d' },
+                   ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 10 } } },
+              y: { display: true, grid: { color: '#21262d' },
+                   ticks: { color: '#8b949e', font: { size: 10 },
+                            callback: v => '$' + v.toLocaleString() } }
+            }
+          }
+        });
+
+        // Drawdown Chart
+        new Chart(document.getElementById('drawdownChart'), {
+          type: 'line',
+          data: {
+            labels: data.dates,
+            datasets: [{
+              label: 'Drawdown',
+              data: data.drawdowns,
+              borderColor: '#f85149',
+              backgroundColor: 'rgba(248,81,73,0.15)',
+              fill: true,
+              tension: 0.2,
+              pointRadius: 0,
+              borderWidth: 1.5,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: { label: ctx => ctx.parsed.y.toFixed(1) + '%' }
+              }
+            },
+            scales: {
+              x: { display: true, grid: { color: '#21262d' },
+                   ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 10 } } },
+              y: { display: true, grid: { color: '#21262d' },
+                   ticks: { color: '#8b949e', font: { size: 10 },
+                            callback: v => v + '%' } }
+            }
+          }
+        });
+      })
+      .catch(() => {
+        document.getElementById('equityChart').parentElement.innerHTML +=
+          '<p class="text-muted text-center" style="font-size:0.8rem">Failed to load equity data</p>';
+      });
+
+    // Annual Returns Bar Chart
+    const annualData = {{ annual_returns | safe }};
+    const years = Object.keys(annualData).sort();
+    const annualVals = years.map(y => (annualData[y] * 100).toFixed(1));
+    const barColors = annualVals.map(v => parseFloat(v) >= 0 ? '#3fb950' : '#f85149');
+    if (years.length > 0) {
+      new Chart(document.getElementById('annualChart'), {
+        type: 'bar',
+        data: {
+          labels: years,
+          datasets: [{
+            data: annualVals,
+            backgroundColor: barColors,
+            borderRadius: 4,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 11 } } },
+            y: { grid: { color: '#21262d' },
+                 ticks: { color: '#8b949e', font: { size: 10 },
+                          callback: v => v + '%' } }
+          }
+        }
+      });
+    }
   </script>
 </body>
 </html>

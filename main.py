@@ -19,6 +19,7 @@ from strategy.scoring import (
     compute_momentum_score,
     select_portfolio,
 )
+from strategy.zipline_backtester import print_tearsheet, run_zipline_backtest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,6 +179,73 @@ def cmd_screen():
     print("=" * 70 + "\n")
 
 
+def cmd_zipline_backtest():
+    """Run Zipline-style event-driven backtest with full tear sheet."""
+    logger.info("Starting Zipline-style backtest...")
+    tickers = config.UNIVERSE_TICKERS
+
+    # Include regime filter ticker (SPY) in the universe for the backtester
+    regime_ticker = getattr(config, "REGIME_TICKER", None)
+    if regime_ticker and regime_ticker not in tickers:
+        tickers = tickers + [regime_ticker]
+
+    # Fetch price data
+    prices = fetch_price_data(tickers)
+    if prices.empty:
+        logger.error(
+            "No price data retrieved — check your Alpaca API keys and ticker list"
+        )
+        return
+
+    logger.info(f"Price data: {prices.shape[0]} days × {prices.shape[1]} tickers")
+
+    # Fetch historical fundamentals (per-quarter, no look-ahead bias)
+    scoring_tickers = [
+        t for t in prices.columns if t != getattr(config, "REGIME_TICKER", "SPY")
+    ]
+    _ = fetch_fundamentals_for_scoring(scoring_tickers)
+    fundamentals = fetch_historical_fundamentals(scoring_tickers)
+    if not fundamentals:
+        logger.warning(
+            "No historical fundamentals retrieved — trying current snapshot..."
+        )
+        fundamentals = fetch_fundamentals_for_scoring(scoring_tickers)
+        if isinstance(fundamentals, pd.DataFrame) and fundamentals.empty:
+            fundamentals = None
+
+    # Fetch benchmark
+    benchmark_prices = fetch_price_data(
+        [config.BENCHMARK_TICKER],
+        start=config.BACKTEST_START,
+        end=config.BACKTEST_END,
+    )
+    bench_series = None
+    if (
+        not benchmark_prices.empty
+        and config.BENCHMARK_TICKER in benchmark_prices.columns
+    ):
+        bench_series = benchmark_prices[config.BENCHMARK_TICKER]
+
+    # Run Zipline-style backtest
+    results = run_zipline_backtest(
+        prices,
+        fundamentals=fundamentals,
+        benchmark_prices=bench_series,
+        initial_capital=config.INITIAL_CAPITAL,
+    )
+
+    # Print tear sheet
+    print_tearsheet(results, benchmark_name=config.BENCHMARK_TICKER)
+
+    # Save outputs
+    if results["trades"] is not None and len(results["trades"]) > 0:
+        results["trades"].to_csv("output/zipline_trades.csv", index=False)
+        logger.info("Trade log saved to output/zipline_trades.csv")
+
+    results["equity_curve"].to_csv("output/zipline_equity.csv")
+    logger.info("Equity curve saved to output/zipline_equity.csv")
+
+
 def cmd_status():
     """Show status of the Alpaca paper trading account."""
     from data_fetcher import _get_alpaca_clients
@@ -206,6 +274,7 @@ def main():
     command = sys.argv[1].lower()
     commands = {
         "backtest": cmd_backtest,
+        "zipline-backtest": cmd_zipline_backtest,
         "screen": cmd_screen,
         "status": cmd_status,
     }

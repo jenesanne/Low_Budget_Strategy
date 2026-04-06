@@ -1,8 +1,12 @@
 """
 Backtester for the Small-Cap Momentum + Value strategy.
 
-Simulates monthly rebalancing on historical price data from Alpaca.
-Produces equity curves, risk metrics, and comparison vs benchmark.
+Daily event-driven simulation with:
+- One bar at a time processing (no look-ahead bias)
+- Next-bar order execution (orders placed on day T fill at day T+1)
+- Trailing stop-loss checked every trading day
+- Dynamic volatility-based slippage model
+- Daily mark-to-market equity tracking
 """
 
 import logging
@@ -91,7 +95,14 @@ def run_backtest(
     initial_capital: float = config.INITIAL_CAPITAL,
 ) -> dict:
     """
-    Run a historical backtest of the strategy.
+    Run a daily event-driven backtest of the strategy.
+
+    Processes one trading day at a time:
+      1. Fill pending orders from yesterday (next-bar execution)
+      2. Mark-to-market all positions (daily)
+      3. Check trailing stop-losses (daily)
+      4. On rebalance days: score stocks, queue orders for tomorrow
+      5. Record daily portfolio value
 
     Args:
         prices: DataFrame of daily close prices (dates × tickers)
@@ -109,289 +120,368 @@ def run_backtest(
         - trades: list of trade records
         - monthly_holdings: dict of {date: [tickers]}
     """
-    # Resample to get month-end dates for rebalance points
-    monthly_dates = prices.resample("ME").last().index
+    prices = prices.sort_index()
+    trading_days = prices.index
 
     # Determine quarterly rebalance months (Mar, Jun, Sep, Dec)
     rebal_freq = getattr(config, "REBALANCE_FREQUENCY", "monthly")
-    if rebal_freq == "quarterly":
-        rebal_months = {3, 6, 9, 12}
-    else:
-        rebal_months = set(range(1, 13))
+    rebal_months = {3, 6, 9, 12} if rebal_freq == "quarterly" else set(range(1, 13))
+    rebal_day = getattr(config, "REBALANCE_DAY", 1)
+    trailing_stop = getattr(config, "TRAILING_STOP", True)
 
     capital = initial_capital
-    holdings = {}  # {ticker: {"shares": float, "entry_price": float}}
+    # holdings: {ticker: {"shares": float, "cost_basis": float, "high_water": float}}
+    holdings = {}
     equity_curve = []
     trade_log = []
     monthly_holdings = {}
+    pending_orders = []  # list of dicts: {"ticker", "shares", "created_dt"}
 
-    # Fetch SPY prices for regime filter if enabled
-    regime_bullish = True  # default: always invest
-    spy_series = None
-    if getattr(config, "USE_REGIME_FILTER", False):
-        regime_ticker = getattr(config, "REGIME_TICKER", "SPY")
-        if regime_ticker in prices.columns:
-            spy_series = prices[regime_ticker]
-        else:
-            logger.warning(
-                f"Regime ticker {regime_ticker} not in price data; regime filter disabled"
-            )
+    # Regime filter
+    use_regime = getattr(config, "USE_REGIME_FILTER", False)
+    regime_ticker = getattr(config, "REGIME_TICKER", "SPY")
+    regime_ma_period = getattr(config, "REGIME_MA_PERIOD", 200)
 
-    for i, rebal_date in enumerate(monthly_dates):
-        # Get price history up to this rebalance date
-        hist = prices.loc[:rebal_date]
-        if len(hist) < config.MOMENTUM_LOOKBACK // 2:
-            # Not enough history yet — stay in cash
-            equity_curve.append({"date": rebal_date, "value": capital})
-            continue
+    def portfolio_value(current_prices):
+        value = capital
+        for tkr, pos in holdings.items():
+            if tkr in current_prices.index and not np.isnan(current_prices[tkr]):
+                value += pos["shares"] * current_prices[tkr]
+        return value
 
-        current_prices = hist.iloc[-1]
+    def is_rebalance_day(dt):
+        if dt.month not in rebal_months:
+            return False
+        month_days = trading_days[
+            (trading_days.month == dt.month) & (trading_days.year == dt.year)
+        ]
+        if len(month_days) == 0:
+            return False
+        day_idx = min(rebal_day - 1, len(month_days) - 1)
+        return dt == month_days[day_idx]
 
-        # ── Market Regime Filter ────────────────────────────────────────
-        if spy_series is not None:
-            spy_hist = spy_series.loc[:rebal_date].dropna()
-            ma_period = getattr(config, "REGIME_MA_PERIOD", 200)
-            if len(spy_hist) >= ma_period:
-                spy_ma = spy_hist.rolling(ma_period).mean().iloc[-1]
-                regime_bullish = spy_hist.iloc[-1] > spy_ma
-            else:
-                regime_bullish = True  # not enough data yet
+    def check_regime(dt):
+        if not use_regime or regime_ticker not in prices.columns:
+            return True
+        spy = prices[regime_ticker].loc[:dt].dropna()
+        if len(spy) < regime_ma_period:
+            return True
+        ma = spy.rolling(regime_ma_period).mean().iloc[-1]
+        return float(spy.iloc[-1]) > float(ma)
 
-        # ── Skip non-rebalance months (just mark-to-market) ─────────────
-        if rebal_date.month not in rebal_months:
-            end_value = capital
-            for ticker, pos in holdings.items():
-                if ticker in current_prices.index and not np.isnan(
-                    current_prices[ticker]
-                ):
-                    end_value += pos["shares"] * current_prices[ticker]
-            equity_curve.append({"date": rebal_date, "value": end_value})
-            monthly_holdings[rebal_date] = list(holdings.keys())
-            continue
-
-        # ── Mark-to-market current holdings ──────────────────────────
-        portfolio_value = capital  # Uninvested cash
-        for ticker, pos in list(holdings.items()):
-            if ticker in current_prices.index and not np.isnan(current_prices[ticker]):
-                portfolio_value += pos["shares"] * current_prices[ticker]
-
-        # ── Score all stocks ─────────────────────────────────────────
-        available_tickers = [t for t in hist.columns if not hist[t].isna().all()]
-        momentum = compute_momentum_score(hist[available_tickers])
-
-        # Value & F-Score: resolve fundamentals for this rebalance date
-        fund_snapshot = None
-        if isinstance(fundamentals, dict):
-            # Historical per-quarter fundamentals — pick the right quarter
-            from strategy.alpha_vantage_fetcher import get_fundamentals_for_date
-
-            fund_snapshot = get_fundamentals_for_date(fundamentals, rebal_date)
-
-            # Enrich with price-based valuation ratios (P/E, P/S, EV/EBITDA)
-            if fund_snapshot is not None:
-                fund_snapshot = _enrich_valuations(fund_snapshot, current_prices)
-        elif isinstance(fundamentals, pd.DataFrame):
-            fund_snapshot = fundamentals
-
-        if fund_snapshot is not None and not fund_snapshot.empty:
-            common = [t for t in available_tickers if t in fund_snapshot.index]
-            value = (
-                compute_value_score(fund_snapshot.loc[common])
-                if common
-                else pd.Series(dtype=float)
-            )
-            fscore = (
-                compute_fscore(fund_snapshot.loc[common])
-                if common
-                else pd.Series(dtype=float)
+    def compute_slippage(ticker, price, dt):
+        lookback = 21
+        if ticker in prices.columns:
+            hist_ticker = prices[ticker].loc[:dt].dropna()
+            rets = hist_ticker.pct_change().dropna()
+            vol = rets.iloc[-lookback:].std() if len(rets) >= lookback else 0.05
+            adv = (
+                float(hist_ticker.iloc[-lookback:].mean()) * 50_000
+                if len(hist_ticker) >= lookback
+                else 1e6
             )
         else:
-            value = pd.Series(50, index=momentum.index, name="value_score")
-            fscore = pd.Series(50, index=momentum.index, name="fscore_score")
+            vol, adv = 0.05, 1e6
+        return (
+            config.TRADING_COST_PCT
+            + config.SLIPPAGE_VOL_MULT * vol
+            + config.SLIPPAGE_LIQUIDITY_MULT * max(0, 1_000_000 - adv) / 100_000
+        )
 
-        composite = compute_composite_score(momentum, value, fscore)
-        new_portfolio = select_portfolio(composite)
+    logger.info(
+        f"Backtest: {len(trading_days)} trading days, "
+        f"${initial_capital:,.0f} initial capital, "
+        f"trailing_stop={'ON' if trailing_stop else 'OFF'}"
+    )
 
-        # ── Sector constraints ───────────────────────────────────────
-        max_sector_pct = getattr(config, "MAX_SECTOR_PCT", 1.0)
-        if (
-            fund_snapshot is not None
-            and "sector" in fund_snapshot.columns
-            and max_sector_pct < 1.0
-        ):
-            sector_counts: dict[str, int] = {}
-            constrained = []
-            for ticker in new_portfolio.index:
-                sector = str(
-                    fund_snapshot.loc[ticker, "sector"]
-                    if ticker in fund_snapshot.index
-                    else ""
-                )
-                if not sector or sector == "":
-                    constrained.append(ticker)
-                    continue
-                max_per_sector = int(len(new_portfolio) * max_sector_pct) + 1
-                sector_counts[sector] = sector_counts.get(sector, 0) + 1
-                if sector_counts[sector] <= max_per_sector:
-                    constrained.append(ticker)
-            if constrained:
-                new_portfolio = new_portfolio.loc[
-                    [t for t in constrained if t in new_portfolio.index]
-                ]
+    for dt in trading_days:
+        current_prices = prices.loc[dt]
 
-        # ── Require minimum scored stocks to avoid concentration ────────
-        if len(composite) < config.MAX_POSITIONS:
-            # Not enough stocks scored — hold current positions
-            end_value = capital
-            for ticker, pos in holdings.items():
-                if ticker in current_prices.index and not np.isnan(
-                    current_prices[ticker]
-                ):
-                    end_value += pos["shares"] * current_prices[ticker]
-            equity_curve.append({"date": rebal_date, "value": end_value})
-            monthly_holdings[rebal_date] = list(holdings.keys())
-            continue
-
-        # ── Regime filter: if bearish, hold current positions but don't rebalance ──
-        # (Only applies when we already have positions; otherwise invest normally)
-        if not regime_bullish and holdings:
-            end_value = capital
-            for ticker, pos in holdings.items():
-                if ticker in current_prices.index and not np.isnan(
-                    current_prices[ticker]
-                ):
-                    end_value += pos["shares"] * current_prices[ticker]
-            equity_curve.append({"date": rebal_date, "value": end_value})
-            monthly_holdings[rebal_date] = list(holdings.keys())
-            continue
-
-        # ── Determine trades ─────────────────────────────────────────
-        current_tickers = set(holdings.keys())
-        target_tickers = set(new_portfolio.index)
-
-        # Sell positions no longer in portfolio
-        for ticker in list(current_tickers - target_tickers):
-            if ticker in current_prices.index and not np.isnan(current_prices[ticker]):
-                sell_price = current_prices[ticker]
-                proceeds = holdings[ticker]["shares"] * sell_price
-                cost = proceeds * config.TRADING_COST_PCT
-                capital += proceeds - cost
-
-                trade_log.append(
-                    {
-                        "date": rebal_date,
-                        "ticker": ticker,
-                        "action": "SELL",
-                        "shares": holdings[ticker]["shares"],
-                        "price": sell_price,
-                        "value": proceeds,
-                        "cost": cost,
-                    }
-                )
-                del holdings[ticker]
-
-        # --- Equal-Weight Position Sizing ---
-        weights = pd.Series(1.0 / len(target_tickers), index=list(target_tickers))
-
-        total_value = capital
-        for ticker, pos in holdings.items():
-            if ticker in current_prices.index:
-                total_value += pos["shares"] * current_prices[ticker]
-
-        for ticker in target_tickers:
+        # ── 1. Fill pending orders (next-bar execution) ──────────────
+        filled = []
+        for order in pending_orders:
+            ticker = order["ticker"]
             if ticker not in current_prices.index or np.isnan(current_prices[ticker]):
                 continue
-            price = current_prices[ticker]
-            if price <= 0:
-                continue
+            price = float(current_prices[ticker])
+            slippage_pct = compute_slippage(ticker, price, dt)
 
-            current_value = holdings.get(ticker, {}).get("shares", 0) * price
-            target_value = weights[ticker] * total_value
-            diff = target_value - current_value
+            if order["shares"] > 0:
+                # BUY — slippage pushes price up
+                fill_price = price * (1 + slippage_pct)
+                total_cost = order["shares"] * fill_price
+                if total_cost > capital:
+                    order["shares"] = (capital * 0.99) / fill_price
+                    if order["shares"] < 0.01:
+                        filled.append(order)
+                        continue
+                    total_cost = order["shares"] * fill_price
 
-            if abs(diff) < config.MIN_POSITION_SIZE:
-                continue  # Skip tiny rebalances
-
-            # Skip if position is within threshold of target (reduces churn)
-            rebal_threshold = getattr(config, "REBALANCE_THRESHOLD_PCT", 0.0)
-            if target_value > 0 and abs(diff) / target_value < rebal_threshold:
-                continue
-
-            if diff > 0 and capital >= config.MIN_POSITION_SIZE:
-                # Buy
-                buy_amount = min(diff, capital)
-
-                # --- Dynamic Slippage Model ---
-                # Slippage = base trading cost + volatility component + liquidity component
-                # For investors: This models real-world execution risk, especially in small-caps.
-                #   - Volatility: Higher volatility = more slippage
-                #   - Liquidity: Lower ADV = more slippage
-                lookback = 21
-                returns = (
-                    hist[ticker].pct_change().dropna()
-                    if ticker in hist.columns
-                    else pd.Series(dtype=float)
-                )
-                vol = returns[-lookback:].std() if len(returns) >= lookback else 0.05
-                adv = (
-                    price * hist[ticker].iloc[-lookback:].mean()
-                    if ticker in hist.columns
-                    else 1e6
-                )
-                slippage = (
-                    config.TRADING_COST_PCT
-                    + config.SLIPPAGE_VOL_MULT * vol
-                    + config.SLIPPAGE_LIQUIDITY_MULT * max(0, 1_000_000 - adv) / 100_000
-                )
-                cost = buy_amount * slippage
-                shares_to_buy = (buy_amount - cost) / price
-                capital -= buy_amount
+                capital -= total_cost
 
                 if ticker in holdings:
-                    # Average up
-                    total_shares = holdings[ticker]["shares"] + shares_to_buy
-                    total_cost_basis = (
-                        holdings[ticker]["shares"] * holdings[ticker]["entry_price"]
-                        + shares_to_buy * price
+                    old = holdings[ticker]
+                    new_shares = old["shares"] + order["shares"]
+                    new_cost = (
+                        old["shares"] * old["cost_basis"] + order["shares"] * fill_price
                     )
                     holdings[ticker] = {
-                        "shares": total_shares,
-                        "entry_price": total_cost_basis / total_shares,
+                        "shares": new_shares,
+                        "cost_basis": new_cost / new_shares,
+                        "high_water": max(
+                            old.get("high_water", fill_price), fill_price
+                        ),
                     }
                 else:
                     holdings[ticker] = {
-                        "shares": shares_to_buy,
-                        "entry_price": price,
+                        "shares": order["shares"],
+                        "cost_basis": fill_price,
+                        "high_water": fill_price,
                     }
 
                 trade_log.append(
                     {
-                        "date": rebal_date,
+                        "date": dt,
                         "ticker": ticker,
                         "action": "BUY",
-                        "shares": shares_to_buy,
+                        "shares": order["shares"],
                         "price": price,
-                        "value": buy_amount,
-                        "cost": cost,
-                        "slippage": slippage,
-                        "volatility": vol,
-                        "adv": adv,
+                        "fill_price": round(fill_price, 4),
+                        "value": round(total_cost, 2),
+                        "cost": round(total_cost - order["shares"] * price, 2),
+                        "slippage_pct": round(slippage_pct, 6),
+                    }
+                )
+            else:
+                # SELL — slippage pushes price down
+                sell_shares = abs(order["shares"])
+                fill_price = price * (1 - slippage_pct)
+                proceeds = sell_shares * fill_price
+                capital += proceeds
+
+                if ticker in holdings:
+                    holdings[ticker]["shares"] -= sell_shares
+                    if holdings[ticker]["shares"] <= 0.001:
+                        del holdings[ticker]
+
+                trade_log.append(
+                    {
+                        "date": dt,
+                        "ticker": ticker,
+                        "action": "SELL",
+                        "shares": sell_shares,
+                        "price": price,
+                        "fill_price": round(fill_price, 4),
+                        "value": round(proceeds, 2),
+                        "cost": round(sell_shares * price - proceeds, 2),
+                        "slippage_pct": round(slippage_pct, 6),
                     }
                 )
 
-        # ── Record equity & holdings ─────────────────────────────────
-        end_value = capital
+            filled.append(order)
+
+        pending_orders = [o for o in pending_orders if o not in filled]
+
+        # ── 2. Update high-water marks for trailing stops ────────────
         for ticker, pos in holdings.items():
             if ticker in current_prices.index and not np.isnan(current_prices[ticker]):
-                end_value += pos["shares"] * current_prices[ticker]
+                price = float(current_prices[ticker])
+                if price > pos.get("high_water", 0):
+                    pos["high_water"] = price
 
-        equity_curve.append({"date": rebal_date, "value": end_value})
-        monthly_holdings[rebal_date] = list(holdings.keys())
+        # ── 3. Check trailing stop-losses (daily) ───────────────────
+        pending_sell_tickers = {o["ticker"] for o in pending_orders if o["shares"] < 0}
+        for ticker, pos in list(holdings.items()):
+            if ticker in pending_sell_tickers:
+                continue
+            if ticker not in current_prices.index or np.isnan(current_prices[ticker]):
+                continue
+            price = float(current_prices[ticker])
+
+            if trailing_stop:
+                # Trailing stop: measure decline from high-water mark
+                hwm = pos.get("high_water", pos["cost_basis"])
+                pct_from_peak = (price - hwm) / hwm
+            else:
+                # Fixed stop: measure decline from entry cost basis
+                pct_from_peak = (price - pos["cost_basis"]) / pos["cost_basis"]
+
+            if pct_from_peak <= config.STOP_LOSS_PCT:
+                ref_price = (
+                    pos.get("high_water", pos["cost_basis"])
+                    if trailing_stop
+                    else pos["cost_basis"]
+                )
+                logger.info(
+                    f"{dt.date()}: TRAILING-STOP {ticker} at {pct_from_peak:.1%} "
+                    f"(peak=${ref_price:.2f}, now=${price:.2f})"
+                )
+                pending_orders.append(
+                    {
+                        "ticker": ticker,
+                        "shares": -pos["shares"],
+                        "created_dt": dt,
+                    }
+                )
+
+        # ── 4. Rebalance if scheduled ────────────────────────────────
+        if is_rebalance_day(dt):
+            hist = prices.loc[:dt]
+            if len(hist) >= config.MOMENTUM_LOOKBACK // 2:
+                regime_ok = check_regime(dt)
+
+                if not regime_ok and holdings:
+                    logger.info(f"{dt.date()}: Bearish regime — skipping rebalance")
+                else:
+                    # Score stocks
+                    scoring_tickers = [
+                        t
+                        for t in hist.columns
+                        if t != regime_ticker and not hist[t].isna().all()
+                    ]
+                    momentum = compute_momentum_score(hist[scoring_tickers])
+
+                    fund_snapshot = None
+                    if isinstance(fundamentals, dict):
+                        from strategy.alpha_vantage_fetcher import (
+                            get_fundamentals_for_date,
+                        )
+
+                        fund_snapshot = get_fundamentals_for_date(fundamentals, dt)
+                        if fund_snapshot is not None:
+                            fund_snapshot = _enrich_valuations(
+                                fund_snapshot, current_prices
+                            )
+                    elif isinstance(fundamentals, pd.DataFrame):
+                        fund_snapshot = fundamentals
+
+                    if fund_snapshot is not None and not fund_snapshot.empty:
+                        common = [
+                            t for t in scoring_tickers if t in fund_snapshot.index
+                        ]
+                        value = (
+                            compute_value_score(fund_snapshot.loc[common])
+                            if common
+                            else pd.Series(dtype=float)
+                        )
+                        fscore = (
+                            compute_fscore(fund_snapshot.loc[common])
+                            if common
+                            else pd.Series(dtype=float)
+                        )
+                    else:
+                        value = pd.Series(50, index=momentum.index, name="value_score")
+                        fscore = pd.Series(
+                            50, index=momentum.index, name="fscore_score"
+                        )
+
+                    composite = compute_composite_score(momentum, value, fscore)
+
+                    if len(composite) >= config.MAX_POSITIONS:
+                        new_portfolio = select_portfolio(composite)
+
+                        # Sector constraints
+                        max_sector_pct = getattr(config, "MAX_SECTOR_PCT", 1.0)
+                        if (
+                            fund_snapshot is not None
+                            and "sector" in fund_snapshot.columns
+                            and max_sector_pct < 1.0
+                        ):
+                            sector_counts = {}
+                            constrained = []
+                            for tkr in new_portfolio.index:
+                                sector = str(
+                                    fund_snapshot.loc[tkr, "sector"]
+                                    if tkr in fund_snapshot.index
+                                    else ""
+                                )
+                                if not sector:
+                                    constrained.append(tkr)
+                                    continue
+                                max_per = int(len(new_portfolio) * max_sector_pct) + 1
+                                sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                                if sector_counts[sector] <= max_per:
+                                    constrained.append(tkr)
+                            if constrained:
+                                new_portfolio = new_portfolio.loc[
+                                    [t for t in constrained if t in new_portfolio.index]
+                                ]
+
+                        target_tickers = set(new_portfolio.index)
+                        current_tickers = set(holdings.keys())
+                        pending_sell_tickers = {
+                            o["ticker"] for o in pending_orders if o["shares"] < 0
+                        }
+
+                        # Sell positions no longer in target
+                        for ticker in current_tickers - target_tickers:
+                            if ticker in pending_sell_tickers:
+                                continue
+                            if ticker in holdings:
+                                pending_orders.append(
+                                    {
+                                        "ticker": ticker,
+                                        "shares": -holdings[ticker]["shares"],
+                                        "created_dt": dt,
+                                    }
+                                )
+
+                        # Equal-weight buy/rebalance
+                        total_val = portfolio_value(current_prices)
+                        target_weight = (
+                            1.0 / len(target_tickers) if target_tickers else 0
+                        )
+
+                        for ticker in target_tickers:
+                            if ticker not in current_prices.index or np.isnan(
+                                current_prices[ticker]
+                            ):
+                                continue
+                            price = float(current_prices[ticker])
+                            if price <= 0:
+                                continue
+
+                            current_shares = (
+                                holdings[ticker]["shares"] if ticker in holdings else 0
+                            )
+                            current_val = current_shares * price
+                            target_val = target_weight * total_val
+                            diff = target_val - current_val
+
+                            rebal_threshold = getattr(
+                                config, "REBALANCE_THRESHOLD_PCT", 0.0
+                            )
+                            if (
+                                target_val > 0
+                                and abs(diff) / target_val < rebal_threshold
+                            ):
+                                continue
+                            if abs(diff) < config.MIN_POSITION_SIZE:
+                                continue
+
+                            shares_diff = diff / price
+                            pending_orders.append(
+                                {
+                                    "ticker": ticker,
+                                    "shares": shares_diff,
+                                    "created_dt": dt,
+                                }
+                            )
+
+                        logger.info(
+                            f"{dt.date()}: Queued rebalance → target: {sorted(target_tickers)}"
+                        )
+
+                        monthly_holdings[dt] = list(target_tickers)
+
+        # ── 5. Record daily equity ───────────────────────────────────
+        pv = portfolio_value(current_prices)
+        equity_curve.append({"date": dt, "value": pv})
 
     # ── Build results ────────────────────────────────────────────────────
     equity_df = pd.DataFrame(equity_curve).set_index("date")["value"]
     returns = equity_df.pct_change().dropna()
-    metrics = compute_portfolio_metrics(returns)
+    metrics = compute_portfolio_metrics(returns, periods_per_year=252)
 
     return {
         "equity_curve": equity_df,
@@ -407,15 +497,15 @@ def run_benchmark(
     initial_capital: float = config.INITIAL_CAPITAL,
 ) -> dict:
     """
-    Run a buy-and-hold benchmark for comparison.
+    Run a buy-and-hold benchmark for comparison (daily granularity).
     """
-    monthly = benchmark_prices.resample("ME").last().dropna()
-    shares = initial_capital / monthly.iloc[0]
-    equity = monthly * shares
+    daily = benchmark_prices.dropna()
+    shares = initial_capital / daily.iloc[0]
+    equity = daily * shares
     equity.name = "value"
 
     returns = equity.pct_change().dropna()
-    metrics = compute_portfolio_metrics(returns)
+    metrics = compute_portfolio_metrics(returns, periods_per_year=252)
 
     return {
         "equity_curve": equity,
