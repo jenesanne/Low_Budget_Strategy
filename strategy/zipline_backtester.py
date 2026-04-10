@@ -30,7 +30,10 @@ from strategy.scoring import (
     compute_composite_score,
     compute_fscore,
     compute_momentum_score,
+    compute_trend_score,
     compute_value_score,
+    compute_volume_score,
+    passes_trend_template,
     select_portfolio,
 )
 
@@ -356,16 +359,40 @@ class ZiplineBacktester:
 
         # Rebalance schedule
         freq = getattr(config, "REBALANCE_FREQUENCY", "monthly")
-        self.rebal_months = {3, 6, 9, 12} if freq == "quarterly" else set(range(1, 13))
+        if freq == "quarterly":
+            self.rebal_months = {3, 6, 9, 12}
+        else:
+            self.rebal_months = set(range(1, 13))
         self.rebal_day = getattr(config, "REBALANCE_DAY", 1)
+        self.daily_mode = freq == "daily"
 
-        # Regime filter
+        # Regime filter with hysteresis
         self.use_regime = getattr(config, "USE_REGIME_FILTER", False)
         self.regime_ticker = getattr(config, "REGIME_TICKER", "SPY")
         self.regime_ma = getattr(config, "REGIME_MA_PERIOD", 200)
+        self.regime_exit_pct = getattr(config, "REGIME_EXIT_PCT", -0.02)
+        self.regime_enter_pct = getattr(config, "REGIME_ENTER_PCT", 0.01)
+        self._regime_bullish = True  # Start bullish, switch on signals
 
         # Trailing stop
         self.trailing_stop = getattr(config, "TRAILING_STOP", True)
+
+        # ATR stop parameters (Turtle Traders)
+        self.atr_stop_mult = getattr(config, "ATR_STOP_MULT", 0)
+        self.atr_period = getattr(config, "ATR_PERIOD", 20)
+
+        # Inverse-volatility position sizing
+        self.inv_vol_sizing = getattr(config, "INVERSE_VOL_SIZING", False)
+        self.inv_vol_lookback = getattr(config, "INVERSE_VOL_LOOKBACK", 21)
+
+        # Portfolio drawdown circuit breaker
+        self.portfolio_dd_limit = getattr(config, "PORTFOLIO_DD_LIMIT", -0.20)
+        self.portfolio_dd_reentry = getattr(config, "PORTFOLIO_DD_REENTRY", -0.10)
+        self._portfolio_hwm = initial_capital
+        self._portfolio_in_dd_cash = False  # True = circuit breaker tripped
+
+        # Track stop-outs for daily slot refilling
+        self._slots_freed_today = False
 
     # ── Portfolio Valuation ───────────────────────────────────────────────
 
@@ -383,7 +410,9 @@ class ZiplineBacktester:
     def _is_rebalance_day(
         self, dt: pd.Timestamp, trading_days: pd.DatetimeIndex
     ) -> bool:
-        """First trading day of a rebalance month."""
+        """First trading day of a rebalance month, or every day in daily mode."""
+        if self.daily_mode:
+            return True
         if dt.month not in self.rebal_months:
             return False
         month_days = trading_days[
@@ -397,7 +426,13 @@ class ZiplineBacktester:
     # ── Market Regime ─────────────────────────────────────────────────────
 
     def _check_regime(self, dt: pd.Timestamp) -> bool:
-        """True if market regime is bullish (or filter disabled)."""
+        """
+        Regime filter with hysteresis to prevent whipsaw.
+
+        - Go bearish when SPY drops REGIME_EXIT_PCT below 200-day MA
+        - Go bullish when SPY climbs REGIME_ENTER_PCT above 200-day MA
+        - Between thresholds: maintain previous state
+        """
         if not self.use_regime:
             return True
         if self.regime_ticker not in self.prices.columns:
@@ -405,8 +440,28 @@ class ZiplineBacktester:
         spy = self.prices[self.regime_ticker].loc[:dt].dropna()
         if len(spy) < self.regime_ma:
             return True
-        ma = spy.rolling(self.regime_ma).mean().iloc[-1]
-        return float(spy.iloc[-1]) > float(ma)
+        ma = float(spy.rolling(self.regime_ma).mean().iloc[-1])
+        price = float(spy.iloc[-1])
+        pct_vs_ma = (price - ma) / ma
+
+        if self._regime_bullish:
+            # Currently bullish — switch to bearish if SPY drops below exit threshold
+            if pct_vs_ma <= self.regime_exit_pct:
+                self._regime_bullish = False
+                logger.info(
+                    f"{dt.date()}: Regime → BEARISH "
+                    f"(SPY {pct_vs_ma:+.1%} vs 200-MA)"
+                )
+        else:
+            # Currently bearish — switch to bullish if SPY rises above enter threshold
+            if pct_vs_ma >= self.regime_enter_pct:
+                self._regime_bullish = True
+                logger.info(
+                    f"{dt.date()}: Regime → BULLISH "
+                    f"(SPY {pct_vs_ma:+.1%} vs 200-MA)"
+                )
+
+        return self._regime_bullish
 
     # ── Slippage Inputs ───────────────────────────────────────────────────
 
@@ -532,10 +587,25 @@ class ZiplineBacktester:
 
         # Regime check
         regime_ok = self._check_regime(dt)
-        if not regime_ok and self.positions:
-            logger.info(f"{dt.date()}: Bearish regime — skipping rebalance")
+        if not regime_ok:
+            # O'Neil's rule: when market turns bearish, go to cash
+            if self.positions:
+                pending_sells = {o.ticker for o in self.pending_orders if o.shares < 0}
+                for ticker, pos in self.positions.items():
+                    if ticker not in pending_sells:
+                        self.pending_orders.append(
+                            Order(
+                                ticker=ticker,
+                                shares=-pos.shares,
+                                created_dt=dt,
+                            )
+                        )
+                logger.info(
+                    f"{dt.date()}: Bearish regime — selling all "
+                    f"{len(self.positions)} positions"
+                )
             self.rebalance_log.append(
-                {"date": dt, "action": "SKIP_BEARISH", "n_orders": 0}
+                {"date": dt, "action": "SELL_BEARISH", "n_orders": len(self.positions)}
             )
             return
 
@@ -545,9 +615,20 @@ class ZiplineBacktester:
             for t in hist.columns
             if t != self.regime_ticker and not hist[t].isna().all()
         ]
+
+        # 1. Momentum score (O'Neil / Jegadeesh & Titman)
         momentum = compute_momentum_score(hist[scoring_tickers])
 
-        # Resolve fundamentals for this date (no look-ahead)
+        # 2. Trend strength score (Minervini)
+        trend = compute_trend_score(hist[scoring_tickers])
+
+        # 3. Volume/breakout score (Darvas / Weinstein)
+        volume = compute_volume_score(hist[scoring_tickers])
+
+        # 4. Trend Template hard filter (Minervini gate)
+        trend_filter = passes_trend_template(hist[scoring_tickers])
+
+        # 5. Resolve fundamentals for this date (no look-ahead)
         fund_snapshot = None
         if isinstance(self.fundamentals, dict):
             from strategy.alpha_vantage_fetcher import get_fundamentals_for_date
@@ -574,15 +655,19 @@ class ZiplineBacktester:
             value = pd.Series(50, index=momentum.index, name="value_score")
             fscore = pd.Series(50, index=momentum.index, name="fscore_score")
 
-        composite = compute_composite_score(momentum, value, fscore)
+        # Composite score with all 4 factors
+        composite = compute_composite_score(
+            momentum, value, fscore, trend=trend, volume=volume
+        )
 
         if len(composite) < config.MAX_POSITIONS:
             return
 
+        # Select portfolio with trend template filter
+        new_portfolio = select_portfolio(composite, trend_filter=trend_filter)
+
         # Sector constraints
         max_sector_pct = getattr(config, "MAX_SECTOR_PCT", 1.0)
-        new_portfolio = select_portfolio(composite)
-
         if (
             fund_snapshot is not None
             and "sector" in fund_snapshot.columns
@@ -614,24 +699,56 @@ class ZiplineBacktester:
         # Tickers that already have a pending sell (from stop-loss)
         pending_sells = {o.ticker for o in self.pending_orders if o.shares < 0}
 
-        # ── Sell positions no longer in target ──
+        # ── Hysteresis: only sell if stock drops below rank threshold ──
+        # (Minervini: give winners room to run, don't churn on small rank changes)
+        hysteresis_rank = getattr(config, "HYSTERESIS_RANK", 30)
         for ticker in current_tickers - target_tickers:
             if ticker in pending_sells:
-                continue  # already have a stop-loss sell queued
-            if ticker in self.positions:
-                self.pending_orders.append(
-                    Order(
-                        ticker=ticker,
-                        shares=-self.positions[ticker].shares,
-                        created_dt=dt,
+                continue
+            if ticker not in composite.index:
+                # No score data — sell it
+                if ticker in self.positions:
+                    self.pending_orders.append(
+                        Order(
+                            ticker=ticker,
+                            shares=-self.positions[ticker].shares,
+                            created_dt=dt,
+                        )
                     )
-                )
+                continue
+            # Check rank in the full composite — only sell if rank dropped below threshold
+            rank_position = list(composite.index).index(ticker) + 1
+            if rank_position > hysteresis_rank:
+                if ticker in self.positions:
+                    self.pending_orders.append(
+                        Order(
+                            ticker=ticker,
+                            shares=-self.positions[ticker].shares,
+                            created_dt=dt,
+                        )
+                    )
+            # else: keep holding — still in top N, just not top 8
 
-        # ── Equal-weight buy/rebalance into target ──
+        # ── Inverse-vol or equal-weight buy into open slots ──
+        # Include held positions that survived hysteresis
+        actual_sells = {
+            o.ticker for o in self.pending_orders if o.shares < 0 and o.created_dt == dt
+        }
+        kept_positions = current_tickers - actual_sells - pending_sells
+        # Merge: target picks + held keepers (cap at max positions)
+        effective_portfolio = list(target_tickers | kept_positions)[
+            : config.MAX_POSITIONS
+        ]
         total_value = self._portfolio_value(current_prices)
-        target_weight = 1.0 / len(target_tickers) if target_tickers else 0
 
-        for ticker in target_tickers:
+        # Compute weights: inverse-vol or equal-weight
+        if self.inv_vol_sizing and effective_portfolio:
+            weights = self._compute_inv_vol_weights(effective_portfolio, dt)
+        else:
+            eq_w = 1.0 / len(effective_portfolio) if effective_portfolio else 0
+            weights = {t: eq_w for t in effective_portfolio}
+
+        for ticker in effective_portfolio:
             if ticker not in current_prices.index or np.isnan(current_prices[ticker]):
                 continue
             price = float(current_prices[ticker])
@@ -642,7 +759,7 @@ class ZiplineBacktester:
                 self.positions[ticker].shares if ticker in self.positions else 0
             )
             current_value = current_shares * price
-            target_value = target_weight * total_value
+            target_value = weights.get(ticker, 0) * total_value
             diff = target_value - current_value
 
             # Skip small rebalances
@@ -672,10 +789,279 @@ class ZiplineBacktester:
             f"target: {sorted(target_tickers)}"
         )
 
-    # ── Stop-Loss Monitoring (Trailing) ─────────────────────────────────
+    # ── Daily Slot Refill (after stop-outs) ───────────────────────────────
+
+    def _fill_empty_slots(self, dt: pd.Timestamp):
+        """
+        When a stop-out frees a slot, find the next best candidate and buy it.
+        This prevents capital from sitting idle between scheduled rebalances.
+        Runs daily, but only acts when there are empty slots.
+        """
+        max_pos = config.MAX_POSITIONS
+        pending_sells = {o.ticker for o in self.pending_orders if o.shares < 0}
+        pending_buys = {o.ticker for o in self.pending_orders if o.shares > 0}
+
+        # Count effective positions (current - pending sells + pending buys)
+        current_count = (
+            len(self.positions)
+            - len(pending_sells & set(self.positions.keys()))
+            + len(pending_buys - set(self.positions.keys()))
+        )
+
+        if current_count >= max_pos:
+            return  # No empty slots
+
+        slots_to_fill = max_pos - current_count
+        if slots_to_fill <= 0:
+            return
+
+        # Check regime
+        if not self._check_regime(dt):
+            return
+
+        hist = self.prices.loc[:dt]
+        if len(hist) < config.MOMENTUM_LOOKBACK // 2:
+            return
+
+        current_prices = hist.iloc[-1]
+        scoring_tickers = [
+            t
+            for t in hist.columns
+            if t != self.regime_ticker and not hist[t].isna().all()
+        ]
+
+        # Quick scoring — momentum + trend template only (skip fundamentals for speed)
+        momentum = compute_momentum_score(hist[scoring_tickers])
+        trend = compute_trend_score(hist[scoring_tickers])
+        volume = compute_volume_score(hist[scoring_tickers])
+        trend_filter = passes_trend_template(hist[scoring_tickers])
+
+        fscore = pd.Series(50, index=momentum.index, name="fscore_score")
+        value = pd.Series(50, index=momentum.index, name="value_score")
+
+        composite = compute_composite_score(
+            momentum, value, fscore, trend=trend, volume=volume
+        )
+
+        # Filter to trend-template-passing stocks only
+        passing = trend_filter[trend_filter].index
+        eligible = composite.loc[composite.index.intersection(passing)]
+        if len(eligible) == 0:
+            eligible = composite  # fall back if none pass
+
+        # Exclude stocks we already hold or have pending orders for
+        held = set(self.positions.keys()) | pending_buys | pending_sells
+        candidates = eligible.loc[~eligible.index.isin(held)]
+
+        if len(candidates) == 0:
+            return
+
+        # Take top N candidates to fill available slots
+        picks = candidates.head(slots_to_fill)
+        total_value = self._portfolio_value(current_prices)
+
+        # Inverse-vol sizing for slot refills too
+        if self.inv_vol_sizing:
+            weights = self._compute_inv_vol_weights(list(picks.index), dt)
+        else:
+            weights = {t: 1.0 / max_pos for t in picks.index}
+
+        for ticker in picks.index:
+            if ticker not in current_prices.index or np.isnan(current_prices[ticker]):
+                continue
+            price = float(current_prices[ticker])
+            if price <= 0:
+                continue
+
+            target_value = weights.get(ticker, 1.0 / max_pos) * total_value
+            if target_value < config.MIN_POSITION_SIZE:
+                continue
+
+            shares = target_value / price
+            self.pending_orders.append(
+                Order(ticker=ticker, shares=shares, created_dt=dt)
+            )
+            logger.info(f"{dt.date()}: SLOT-REFILL → {ticker} (${target_value:.0f})")
+
+    # ── Inverse-Volatility Position Sizing ──────────────────────────────
+
+    def _compute_inv_vol_weights(
+        self, tickers: list[str], dt: pd.Timestamp
+    ) -> dict[str, float]:
+        """
+        Compute position weights inversely proportional to realized volatility.
+        High-vol stocks get smaller allocations → more balanced risk contribution.
+        Falls back to equal-weight if vol data is insufficient.
+        """
+        inv_vols = {}
+        for ticker in tickers:
+            if ticker not in self.prices.columns:
+                continue
+            hist = self.prices[ticker].loc[:dt].dropna()
+            if len(hist) < self.inv_vol_lookback + 1:
+                continue
+            returns = hist.pct_change().dropna().iloc[-self.inv_vol_lookback :]
+            vol = returns.std()
+            if vol > 0:
+                inv_vols[ticker] = 1.0 / vol
+
+        if not inv_vols:
+            # Fallback to equal weight
+            return {t: 1.0 / len(tickers) for t in tickers}
+
+        total_inv_vol = sum(inv_vols.values())
+        weights = {t: iv / total_inv_vol for t, iv in inv_vols.items()}
+
+        # Enforce MAX_POSITION_PCT cap and redistribute excess
+        max_pct = getattr(config, "MAX_POSITION_PCT", 1.0)
+        capped = {}
+        excess = 0.0
+        uncapped = []
+        for t, w in weights.items():
+            if w > max_pct:
+                capped[t] = max_pct
+                excess += w - max_pct
+            else:
+                capped[t] = w
+                uncapped.append(t)
+
+        # Redistribute excess proportionally to uncapped positions
+        if excess > 0 and uncapped:
+            uncapped_total = sum(capped[t] for t in uncapped)
+            if uncapped_total > 0:
+                for t in uncapped:
+                    capped[t] += excess * (capped[t] / uncapped_total)
+
+        # Include tickers that had no vol data with minimum weight
+        for t in tickers:
+            if t not in capped:
+                capped[t] = 1.0 / len(tickers)
+
+        return capped
+
+    # ── Portfolio Drawdown Circuit Breaker ────────────────────────────────
+
+    def _check_portfolio_drawdown(self, dt: pd.Timestamp, pv: float) -> bool:
+        """
+        Portfolio-level circuit breaker.
+        - Trips when DD from peak exceeds PORTFOLIO_DD_LIMIT → sell everything
+        - Re-enters on the next scheduled rebalance day (wait at least ~1 month)
+        - Resets HWM at re-entry so we start fresh
+        Returns True if we should be in cash.
+        """
+        # Update high-water mark (only when not in DD cash)
+        if not self._portfolio_in_dd_cash and pv > self._portfolio_hwm:
+            self._portfolio_hwm = pv
+
+        if not self._portfolio_in_dd_cash:
+            dd = (pv - self._portfolio_hwm) / self._portfolio_hwm
+            if dd <= self.portfolio_dd_limit:
+                self._portfolio_in_dd_cash = True
+                self._dd_trip_date = dt
+                logger.info(
+                    f"{dt.date()}: PORTFOLIO CIRCUIT BREAKER — "
+                    f"DD={dd:.1%} breached {self.portfolio_dd_limit:.0%} limit, "
+                    f"going to cash"
+                )
+                return True
+        else:
+            # Already in DD-cash — stay until next rebalance day (cooldown)
+            # This ensures we wait at least until next month before re-entering
+            return True
+
+        return False
+
+    def _try_dd_reentry(self, dt: pd.Timestamp, trading_days: pd.DatetimeIndex) -> bool:
+        """
+        Check if we should exit the DD-cash state on a rebalance day.
+        Returns True if re-entering (circuit breaker cleared).
+        """
+        if not self._portfolio_in_dd_cash:
+            return False
+
+        # Only re-enter on a scheduled rebalance day (wait for next month)
+        if not self._is_rebalance_day(dt, trading_days):
+            return False
+
+        # Must be at least some days after the trip (avoid same-day re-entry)
+        if hasattr(self, "_dd_trip_date") and dt <= self._dd_trip_date:
+            return False
+
+        # Also require regime to be bullish
+        if not self._check_regime(dt):
+            return False
+
+        self._portfolio_in_dd_cash = False
+        # Reset HWM to current value so we start fresh
+        pv = self._portfolio_value(self.prices.loc[dt])
+        self._portfolio_hwm = pv
+        logger.info(
+            f"{dt.date()}: PORTFOLIO DD RECOVERY — "
+            f"re-entering on rebalance day, HWM reset to ${pv:.0f}"
+        )
+        return True
+
+    # ── ATR Computation (Turtle Traders) ─────────────────────────────────
+
+    def _compute_atr(self, ticker: str, dt: pd.Timestamp) -> Optional[float]:
+        """Compute Average True Range for ATR-based stops."""
+        if ticker not in self.prices.columns:
+            return None
+        hist = self.prices[ticker].loc[:dt].dropna()
+        if len(hist) < self.atr_period + 1:
+            return None
+        tr = hist.diff().abs().iloc[-self.atr_period :]
+        return float(tr.mean())
+
+    # ── Concentration Cap (daily trim of outsized winners) ──────────────
+
+    def _check_concentration(self, dt: pd.Timestamp):
+        """
+        Trim any position that has drifted above CONCENTRATION_CAP of portfolio.
+        This prevents a single moonshot from dominating portfolio risk.
+        """
+        cap = getattr(config, "CONCENTRATION_CAP", None)
+        target = getattr(config, "CONCENTRATION_TARGET", 0.10)
+        if not cap:
+            return
+
+        current_prices = self.prices.loc[dt]
+        total_value = self._portfolio_value(current_prices)
+        if total_value <= 0:
+            return
+
+        pending_sells = {o.ticker for o in self.pending_orders if o.shares < 0}
+
+        for ticker, pos in list(self.positions.items()):
+            if ticker in pending_sells:
+                continue
+            if ticker not in current_prices.index:
+                continue
+            price = float(current_prices[ticker])
+            if np.isnan(price) or price <= 0:
+                continue
+
+            position_value = pos.shares * price
+            weight = position_value / total_value
+
+            if weight > cap:
+                target_value = target * total_value
+                trim_value = position_value - target_value
+                trim_shares = trim_value / price
+                if trim_shares > 0:
+                    self.pending_orders.append(
+                        Order(ticker=ticker, shares=-trim_shares, created_dt=dt)
+                    )
+                    logger.info(
+                        f"{dt.date()}: CONCENTRATION TRIM {ticker}: "
+                        f"{weight:.1%} → {target:.0%} "
+                        f"(selling ${trim_value:.0f})"
+                    )
+
+    # ── Stop-Loss Monitoring (ATR + Trailing) ─────────────────────────────
 
     def _check_stop_losses(self, dt: pd.Timestamp):
-        """Check positions against trailing stop-loss, queue sell orders."""
+        """Check positions against ATR/trailing stop-loss, queue sell orders."""
         current_prices = self.prices.loc[dt]
         pending_sells = {o.ticker for o in self.pending_orders if o.shares < 0}
 
@@ -692,23 +1078,44 @@ class ZiplineBacktester:
             if price > pos.high_water:
                 pos.high_water = price
 
-            if self.trailing_stop:
-                # Trailing stop: measure decline from high-water mark
-                ref_price = pos.high_water
-                pct_change = (price - ref_price) / ref_price
-            else:
-                # Fixed stop: measure decline from entry cost basis
-                ref_price = pos.cost_basis
-                pct_change = (price - ref_price) / ref_price
+            hwm = pos.high_water
+            triggered = False
+            stop_desc = ""
 
-            if pct_change <= config.STOP_LOSS_PCT:
-                logger.info(
-                    f"{dt.date()}: TRAILING-STOP {ticker} at {pct_change:.1%} "
-                    f"(peak=${ref_price:.2f}, now=${price:.2f})"
-                )
+            # ATR-based trailing stop (Turtle Traders method)
+            if self.atr_stop_mult > 0 and self.trailing_stop:
+                atr = self._compute_atr(ticker, dt)
+                if atr is not None and atr > 0:
+                    stop_level = hwm - self.atr_stop_mult * atr
+                    triggered = price <= stop_level
+                    stop_desc = (
+                        f"ATR-STOP {ticker}: HWM=${hwm:.2f} - "
+                        f"{self.atr_stop_mult}×ATR(${atr:.2f}) "
+                        f"= stop@${stop_level:.2f}, now=${price:.2f}"
+                    )
+
+            # Percentage-based trailing/fixed stop as fallback
+            if not triggered:
+                if self.trailing_stop:
+                    ref_price = hwm
+                    pct_change = (price - ref_price) / ref_price
+                else:
+                    ref_price = pos.cost_basis
+                    pct_change = (price - ref_price) / ref_price
+
+                if pct_change <= config.STOP_LOSS_PCT:
+                    triggered = True
+                    stop_desc = (
+                        f"SAFETY-STOP {ticker}: {pct_change:.1%} "
+                        f"(peak=${ref_price:.2f}, now=${price:.2f})"
+                    )
+
+            if triggered:
+                logger.info(f"{dt.date()}: {stop_desc}")
                 self.pending_orders.append(
                     Order(ticker=ticker, shares=-pos.shares, created_dt=dt)
                 )
+                self._slots_freed_today = True
 
     # ── Main Event Loop ───────────────────────────────────────────────────
 
@@ -741,11 +1148,30 @@ class ZiplineBacktester:
             pv = self._portfolio_value(current_prices)
 
             # 3. Stop-loss check (generates orders for next bar)
+            self._slots_freed_today = False
             self._check_stop_losses(dt)
+
+            # 3a. (Reserved for future use)
+
+            # 3b. Daily regime check — sell all if market turns bearish
+            if self.use_regime and self.positions and not self._check_regime(dt):
+                pending_sells = {o.ticker for o in self.pending_orders if o.shares < 0}
+                for ticker, pos in list(self.positions.items()):
+                    if ticker not in pending_sells:
+                        self.pending_orders.append(
+                            Order(ticker=ticker, shares=-pos.shares, created_dt=dt)
+                        )
+                logger.info(
+                    f"{dt.date()}: REGIME EXIT — SPY below {self.regime_ma}-day MA, "
+                    f"selling {len(self.positions)} positions"
+                )
 
             # 4. Rebalance if scheduled (generates orders for next bar)
             if self._is_rebalance_day(dt, trading_days):
                 self._generate_rebalance_orders(dt)
+            elif self._slots_freed_today:
+                # 4b. Daily slot refill: immediately replace stopped-out positions
+                self._fill_empty_slots(dt)
 
             # 5. Record daily performance
             self.perf.record(dt, pv, self.cash)
@@ -813,7 +1239,7 @@ def print_tearsheet(results: dict, benchmark_name: str = "IWM"):
     print()
     print("═" * 70)
     print("  ZIPLINE-STYLE BACKTEST TEAR SHEET")
-    print("  Small-Cap Momentum + Value + F-Score Strategy")
+    print("  Elite Trader Momentum — Daily Rotation + Trailing Stops")
     print("═" * 70)
 
     # ── Summary ──────────────────────────────────────────────────────
@@ -905,6 +1331,7 @@ def print_tearsheet(results: dict, benchmark_name: str = "IWM"):
         print("  ✓ Benchmark-relative metrics (alpha, beta, IR)")
     print("  ✓ Quarterly rebalancing with regime filter")
     print("  ✓ Trailing stop-loss monitoring (daily)")
+    print("  ✓ Daily slot-refill after stop-outs")
 
     print("═" * 70)
     print()

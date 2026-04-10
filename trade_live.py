@@ -1,8 +1,8 @@
 """
-trade_live.py — Quarterly paper/live rebalancer.
+trade_live.py — Monthly paper/live rebalancer.
 
 Runs the full scoring pipeline and submits rebalance orders via Alpaca.
-Designed to be invoked by cron (first trading day of March, June, Sept, Dec).
+Designed to be invoked by cron on the 1st trading day of each month.
 
 Usage:
     python trade_live.py              # dry-run (prints orders, doesn't submit)
@@ -25,7 +25,10 @@ from strategy.scoring import (
     compute_composite_score,
     compute_fscore,
     compute_momentum_score,
+    compute_trend_score,
     compute_value_score,
+    compute_volume_score,
+    passes_trend_template,
     select_portfolio,
 )
 
@@ -57,7 +60,53 @@ def rebalance():
     capital = config.INITIAL_CAPITAL
     logger.info(f"Account equity: ${equity:,.2f}  |  Strategy capital: ${capital:,.2f}")
 
-    # 2. Score universe -------------------------------------------------------
+    # 2. Regime filter — check if market is bullish -------------------------
+    if config.USE_REGIME_FILTER:
+        logger.info("Checking market regime (SPY vs 200-day MA) ...")
+        spy_prices = fetch_price_data([config.REGIME_TICKER])
+        if not spy_prices.empty and config.REGIME_TICKER in spy_prices.columns:
+            spy = spy_prices[config.REGIME_TICKER].dropna()
+            if len(spy) >= config.REGIME_MA_PERIOD:
+                ma = spy.rolling(config.REGIME_MA_PERIOD).mean().iloc[-1]
+                current_spy = float(spy.iloc[-1])
+                pct_from_ma = (current_spy - ma) / ma
+                regime_exit = getattr(config, "REGIME_EXIT_PCT", -0.02)
+                if pct_from_ma <= regime_exit:
+                    logger.warning(
+                        f"BEARISH REGIME: SPY ${current_spy:.2f} is "
+                        f"{pct_from_ma:.1%} vs 200-day MA ${ma:.2f}. "
+                        f"Selling all positions and going to cash."
+                    )
+                    # Sell all current positions
+                    positions = client.get_all_positions()
+                    if positions and not DRY_RUN:
+                        from alpaca.trading.enums import OrderSide, TimeInForce
+                        from alpaca.trading.requests import MarketOrderRequest
+
+                        for p in positions:
+                            try:
+                                req = MarketOrderRequest(
+                                    symbol=p.symbol,
+                                    qty=float(p.qty),
+                                    side=OrderSide.SELL,
+                                    time_in_force=TimeInForce.DAY,
+                                )
+                                client.submit_order(req)
+                                logger.info(f"REGIME SELL: {p.qty} {p.symbol}")
+                                time.sleep(0.5)
+                            except Exception as e:
+                                logger.error(f"Regime sell failed for {p.symbol}: {e}")
+                    elif positions and DRY_RUN:
+                        for p in positions:
+                            logger.info(f"  DRY-RUN REGIME SELL: {p.qty} {p.symbol}")
+                    return
+                else:
+                    logger.info(
+                        f"BULLISH REGIME: SPY ${current_spy:.2f} is "
+                        f"{pct_from_ma:+.1%} vs 200-day MA ${ma:.2f}. Proceeding."
+                    )
+
+    # 3. Score universe -------------------------------------------------------
     tickers = config.UNIVERSE_TICKERS
     logger.info(f"Fetching prices for {len(tickers)} tickers ...")
     prices = fetch_price_data(tickers)
@@ -65,12 +114,17 @@ def rebalance():
     logger.info("Fetching fundamentals ...")
     fundamentals = fetch_fundamentals_for_scoring(tickers)
 
-    logger.info("Computing composite scores ...")
+    logger.info("Computing Elite Trader Momentum scores ...")
     momentum = compute_momentum_score(prices)
+    trend = compute_trend_score(prices)
+    volume = compute_volume_score(prices)
+    trend_filter = passes_trend_template(prices)
     value = compute_value_score(fundamentals)
     fscore = compute_fscore(fundamentals)
-    scores = compute_composite_score(momentum, value, fscore)
-    portfolio = select_portfolio(scores)
+    scores = compute_composite_score(
+        momentum, value, fscore, trend=trend, volume=volume
+    )
+    portfolio = select_portfolio(scores, trend_filter=trend_filter)
 
     if portfolio.empty:
         logger.warning("No stocks passed scoring. Exiting without trading.")
@@ -79,11 +133,11 @@ def rebalance():
     target_tickers = list(portfolio.index)
     logger.info(f"Target portfolio ({len(target_tickers)}): {target_tickers}")
 
-    # 3. Current positions ----------------------------------------------------
+    # 4. Current positions ----------------------------------------------------
     positions = client.get_all_positions()
     current = {p.symbol: float(p.qty) for p in positions}
 
-    # 4. Calculate target shares (equal-weight, fractional) -------------------
+    # 5. Calculate target shares (equal-weight, fractional) -------------------
     target_value = capital / len(target_tickers)
     latest_prices = prices.iloc[-1]
 
@@ -94,7 +148,7 @@ def rebalance():
             if price > 0:
                 targets[ticker] = round(target_value / price, 4)
 
-    # 5. Compute deltas -------------------------------------------------------
+    # 6. Compute deltas -------------------------------------------------------
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
 
@@ -129,7 +183,7 @@ def rebalance():
             logger.info(f"  {side.value:4s} {qty:>10.4f} {ticker}")
         return
 
-    # 6. Submit orders --------------------------------------------------------
+    # 7. Submit orders --------------------------------------------------------
     submitted = 0
     for ticker, side, qty in all_orders:
         try:

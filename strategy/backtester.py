@@ -1,10 +1,18 @@
 """
-Backtester for the Small-Cap Momentum + Value strategy.
+Elite Trader Momentum — Backtester
 
-Daily event-driven simulation with:
+Daily event-driven simulation combining methods from:
+- Mark Minervini (Trend Template filter)
+- William O'Neil (CANSLIM momentum + relative strength)
+- Nicolas Darvas (Volume breakout + trailing stops)
+- Stan Weinstein (Stage 2 / rising 150-day MA)
+- Turtle Traders (ATR-based trailing stops)
+- Piotroski (F-Score quality gate)
+
+Features:
 - One bar at a time processing (no look-ahead bias)
 - Next-bar order execution (orders placed on day T fill at day T+1)
-- Trailing stop-loss checked every trading day
+- ATR-based adaptive trailing stops (Turtle Traders)
 - Dynamic volatility-based slippage model
 - Daily mark-to-market equity tracking
 """
@@ -22,7 +30,10 @@ from strategy.scoring import (
     compute_composite_score,
     compute_fscore,
     compute_momentum_score,
+    compute_trend_score,
     compute_value_score,
+    compute_volume_score,
+    passes_trend_template,
     select_portfolio,
 )
 
@@ -188,6 +199,19 @@ def run_backtest(
             + config.SLIPPAGE_LIQUIDITY_MULT * max(0, 1_000_000 - adv) / 100_000
         )
 
+    def compute_atr(ticker, dt, period=None):
+        """Compute Average True Range for ATR-based stops (Turtle Traders)."""
+        if period is None:
+            period = getattr(config, "ATR_PERIOD", 20)
+        if ticker not in prices.columns:
+            return None
+        hist = prices[ticker].loc[:dt].dropna()
+        if len(hist) < period + 1:
+            return None
+        # True Range = High - Low, but with close-only data: |close - prev_close|
+        tr = hist.diff().abs().iloc[-(period):]
+        return float(tr.mean())
+
     logger.info(
         f"Backtest: {len(trading_days)} trading days, "
         f"${initial_capital:,.0f} initial capital, "
@@ -290,6 +314,8 @@ def run_backtest(
                     pos["high_water"] = price
 
         # ── 3. Check trailing stop-losses (daily) ───────────────────
+        # Turtle Traders ATR-based stop + Minervini absolute safety net
+        atr_stop_mult = getattr(config, "ATR_STOP_MULT", 3.0)
         pending_sell_tickers = {o["ticker"] for o in pending_orders if o["shares"] < 0}
         for ticker, pos in list(holdings.items()):
             if ticker in pending_sell_tickers:
@@ -298,24 +324,36 @@ def run_backtest(
                 continue
             price = float(current_prices[ticker])
 
-            if trailing_stop:
-                # Trailing stop: measure decline from high-water mark
-                hwm = pos.get("high_water", pos["cost_basis"])
-                pct_from_peak = (price - hwm) / hwm
-            else:
-                # Fixed stop: measure decline from entry cost basis
-                pct_from_peak = (price - pos["cost_basis"]) / pos["cost_basis"]
+            # ATR-based trailing stop (Turtle Traders method)
+            atr = compute_atr(ticker, dt)
+            hwm = pos.get("high_water", pos["cost_basis"])
 
+            if atr is not None and atr > 0 and atr_stop_mult > 0 and trailing_stop:
+                # Stop level = high-water mark - (ATR_STOP_MULT × ATR)
+                stop_level = hwm - atr_stop_mult * atr
+                triggered = price <= stop_level
+                stop_desc = (
+                    f"ATR-STOP {ticker}: HWM=${hwm:.2f} - {atr_stop_mult}×ATR(${atr:.2f})"
+                    f" = stop@${stop_level:.2f}, now=${price:.2f}"
+                )
+            elif trailing_stop:
+                # Fallback: percentage-based trailing stop
+                pct_from_peak = (price - hwm) / hwm
+                triggered = pct_from_peak <= config.STOP_LOSS_PCT
+                stop_desc = f"PCT-STOP {ticker}: {pct_from_peak:.1%} from peak"
+            else:
+                pct_from_entry = (price - pos["cost_basis"]) / pos["cost_basis"]
+                triggered = pct_from_entry <= config.STOP_LOSS_PCT
+                stop_desc = f"FIXED-STOP {ticker}: {pct_from_entry:.1%} from entry"
+
+            # Absolute safety net: never lose more than STOP_LOSS_PCT from peak
+            pct_from_peak = (price - hwm) / hwm
             if pct_from_peak <= config.STOP_LOSS_PCT:
-                ref_price = (
-                    pos.get("high_water", pos["cost_basis"])
-                    if trailing_stop
-                    else pos["cost_basis"]
-                )
-                logger.info(
-                    f"{dt.date()}: TRAILING-STOP {ticker} at {pct_from_peak:.1%} "
-                    f"(peak=${ref_price:.2f}, now=${price:.2f})"
-                )
+                triggered = True
+                stop_desc = f"SAFETY-STOP {ticker}: {pct_from_peak:.1%} from peak"
+
+            if triggered:
+                logger.info(f"{dt.date()}: {stop_desc}")
                 pending_orders.append(
                     {
                         "ticker": ticker,
@@ -333,14 +371,26 @@ def run_backtest(
                 if not regime_ok and holdings:
                     logger.info(f"{dt.date()}: Bearish regime — skipping rebalance")
                 else:
-                    # Score stocks
+                    # Score stocks using Elite Trader Momentum system
                     scoring_tickers = [
                         t
                         for t in hist.columns
                         if t != regime_ticker and not hist[t].isna().all()
                     ]
+
+                    # 1. Momentum score (O'Neil / Jegadeesh & Titman)
                     momentum = compute_momentum_score(hist[scoring_tickers])
 
+                    # 2. Trend strength score (Minervini)
+                    trend = compute_trend_score(hist[scoring_tickers])
+
+                    # 3. Volume/breakout score (Darvas / Weinstein)
+                    volume = compute_volume_score(hist[scoring_tickers])
+
+                    # 4. Trend Template hard filter (Minervini gate)
+                    trend_filter = passes_trend_template(hist[scoring_tickers])
+
+                    # 5. Fundamentals (Piotroski F-Score + Value)
                     fund_snapshot = None
                     if isinstance(fundamentals, dict):
                         from strategy.alpha_vantage_fetcher import (
@@ -375,10 +425,21 @@ def run_backtest(
                             50, index=momentum.index, name="fscore_score"
                         )
 
-                    composite = compute_composite_score(momentum, value, fscore)
+                    # Composite score with all 4 factors
+                    composite = compute_composite_score(
+                        momentum,
+                        value,
+                        fscore,
+                        trend=trend,
+                        volume=volume,
+                    )
 
                     if len(composite) >= config.MAX_POSITIONS:
-                        new_portfolio = select_portfolio(composite)
+                        # Select portfolio with trend template filter
+                        new_portfolio = select_portfolio(
+                            composite,
+                            trend_filter=trend_filter,
+                        )
 
                         # Sector constraints
                         max_sector_pct = getattr(config, "MAX_SECTOR_PCT", 1.0)
@@ -518,7 +579,7 @@ def print_backtest_summary(strategy: dict, benchmark: dict | None = None):
     """Print a formatted summary of backtest results."""
     sm = strategy["metrics"]
     print("\n" + "=" * 60)
-    print("  BACKTEST RESULTS — Small-Cap Momentum + Value Strategy")
+    print("  BACKTEST RESULTS — Elite Trader Momentum Strategy")
     print("=" * 60)
 
     print(f"\n  Start Value:       ${config.INITIAL_CAPITAL:,.2f}")

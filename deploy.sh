@@ -14,14 +14,14 @@ LOG="/var/log/strategy.log"
 
 echo "=== 1. System packages ==="
 apt-get update -qq
-apt-get install -y -qq python3.11 python3.11-venv python3-pip git
+apt-get install -y -qq python3.12 python3.12-venv python3-pip git
 
 echo "=== 2. Clone repo ==="
 rm -rf "$PROJECT_DIR"
 git clone https://github.com/jenesanne/Low_Budget_Strategy.git "$PROJECT_DIR"
 
 echo "=== 3. Python venv + deps ==="
-python3.11 -m venv "$VENV"
+python3.12 -m venv "$VENV"
 "$VENV/bin/pip" install --upgrade pip
 "$VENV/bin/pip" install -r "$PROJECT_DIR/requirements.txt"
 
@@ -37,8 +37,8 @@ ENVEOF
 fi
 
 echo "=== 5. Set up cron ==="
-# Quarterly rebalance: 1st of Mar, Jun, Sep, Dec at 14:30 UTC (after market open)
-CRON_CMD="30 14 1 3,6,9,12 * cd $PROJECT_DIR && $VENV/bin/python trade_live.py --execute >> $LOG 2>&1"
+# Monthly rebalance: 1st of every month at 14:30 UTC (after US market open)
+CRON_CMD="30 14 1 * * cd $PROJECT_DIR && $VENV/bin/python trade_live.py --execute >> $LOG 2>&1"
 
 # Remove existing strategy cron entries, then add
 (crontab -l 2>/dev/null | grep -v "trade_live.py" || true; echo "$CRON_CMD") | crontab -

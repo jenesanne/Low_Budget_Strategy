@@ -17,6 +17,9 @@ from strategy.risk_management import compute_position_sizes
 from strategy.scoring import (
     compute_composite_score,
     compute_momentum_score,
+    compute_trend_score,
+    compute_volume_score,
+    passes_trend_template,
     select_portfolio,
 )
 from strategy.zipline_backtester import print_tearsheet, run_zipline_backtest
@@ -111,40 +114,39 @@ def cmd_screen():
     # Compute momentum scores from price history
     momentum = compute_momentum_score(prices)
 
+    # Compute trend and volume scores (Minervini / Darvas)
+    trend = compute_trend_score(prices)
+    volume = compute_volume_score(prices)
+    trend_filter = passes_trend_template(prices)
+
     # Try to fetch Alpha Vantage fundamentals
     try:
-        from alpha_vantage_fetcher import fetch_fundamentals
+        from strategy.alpha_vantage_fetcher import fetch_fundamentals_for_scoring
 
-        logger.info("Fetching Alpha Vantage fundamentals for value and F-Score...")
-        fundamentals = fetch_fundamentals(list(momentum.index))
-        # Build value and fscore proxies from Alpha Vantage data
-        value = pd.Series(index=momentum.index, dtype=float, name="value_score")
-        fscore = pd.Series(index=momentum.index, dtype=float, name="fscore_score")
-        for ticker, data in fundamentals.items():
-            if not data:
-                continue
-            try:
-                pe = float(data.get("PERatio", 0)) or 1000
-                ps = float(data.get("PriceToSalesRatioTTM", 0)) or 1000
-                roe = float(data.get("ReturnOnEquityTTM", 0))
-                # Value: lower P/E and P/S is better, average percentile
-                value.loc[ticker] = (
-                    100 - pd.Series([pe, ps]).rank(pct=True).mean() * 100
-                )
-                # F-Score proxy: high ROE is good, scale to 0-100
-                fscore.loc[ticker] = min(max(roe, 0), 50) * 2  # Cap at 50% ROE
-            except Exception:
-                value.loc[ticker] = 50
-                fscore.loc[ticker] = 50
-        value = value.fillna(50)
-        fscore = fscore.fillna(50)
+        logger.info("Fetching Alpha Vantage fundamentals for F-Score...")
+        fundamentals = fetch_fundamentals_for_scoring(list(momentum.index))
+        from strategy.scoring import compute_fscore as _compute_fscore
+        from strategy.scoring import compute_value_score as _compute_value_score
+
+        value = (
+            _compute_value_score(fundamentals)
+            if not fundamentals.empty
+            else pd.Series(50, index=momentum.index, name="value_score")
+        )
+        fscore = (
+            _compute_fscore(fundamentals)
+            if not fundamentals.empty
+            else pd.Series(50, index=momentum.index, name="fscore_score")
+        )
     except Exception as e:
         logger.warning(f"Alpha Vantage fundamentals unavailable: {e}")
         value = pd.Series(50, index=momentum.index, name="value_score")
         fscore = pd.Series(50, index=momentum.index, name="fscore_score")
 
-    composite = compute_composite_score(momentum, value, fscore)
-    portfolio = select_portfolio(composite)
+    composite = compute_composite_score(
+        momentum, value, fscore, trend=trend, volume=volume
+    )
+    portfolio = select_portfolio(composite, trend_filter=trend_filter)
 
     # Get latest prices for position sizing
     latest = fetch_latest_prices(list(portfolio.index))
