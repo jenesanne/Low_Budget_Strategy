@@ -124,17 +124,22 @@ def _last_rebalance_log():
 
 
 def _next_rebalance():
-    """Calculate the next quarterly rebalance date."""
+    """Calculate the next monthly rebalance date."""
     now = datetime.now(timezone.utc)
-    rebal_months = [3, 6, 9, 12]
-    for m in rebal_months:
-        candidate = datetime(
-            now.year, m, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc
+    # Try current month first
+    candidate = datetime(
+        now.year, now.month, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc
+    )
+    if candidate > now:
+        return candidate
+    # Next month
+    if now.month == 12:
+        return datetime(
+            now.year + 1, 1, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc
         )
-        if candidate > now:
-            return candidate
-    # Next year Q1
-    return datetime(now.year + 1, 3, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc)
+    return datetime(
+        now.year, now.month + 1, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc
+    )
 
 
 # ── Auth ────────────────────────────────────────────────────────────────────
@@ -468,7 +473,8 @@ def backtest():
         cfg_stop_loss=config.STOP_LOSS_PCT,
         cfg_trailing_stop=config.TRAILING_STOP,
         cfg_momentum_weight=config.MOMENTUM_WEIGHT,
-        cfg_value_weight=config.VALUE_WEIGHT,
+        cfg_trend_weight=config.TREND_WEIGHT,
+        cfg_volume_weight=config.VOLUME_WEIGHT,
         cfg_fscore_weight=config.FSCORE_WEIGHT,
         cfg_min_fscore=config.MIN_FSCORE,
         cfg_max_positions=config.MAX_POSITIONS,
@@ -534,7 +540,8 @@ def _run_backtest_thread(params):
             "stop_loss_pct": ("STOP_LOSS_PCT", float),
             "trailing_stop": ("TRAILING_STOP", lambda v: v == "true"),
             "momentum_weight": ("MOMENTUM_WEIGHT", float),
-            "value_weight": ("VALUE_WEIGHT", float),
+            "trend_weight": ("TREND_WEIGHT", float),
+            "volume_weight": ("VOLUME_WEIGHT", float),
             "fscore_weight": ("FSCORE_WEIGHT", float),
             "min_fscore": ("MIN_FSCORE", int),
             "max_positions": ("MAX_POSITIONS", int),
@@ -634,7 +641,8 @@ def backtest_run():
         "stop_loss_pct",
         "trailing_stop",
         "momentum_weight",
-        "value_weight",
+        "trend_weight",
+        "volume_weight",
         "fscore_weight",
         "min_fscore",
         "max_positions",
@@ -1129,9 +1137,14 @@ BACKTEST_HTML = r"""
                      value="{{ cfg_momentum_weight }}" min="0" max="1">
             </div>
             <div class="col-4 col-md-2">
-              <div class="param-label">Value Wt</div>
-              <input type="number" name="value_weight" class="param-input" step="0.05"
-                     value="{{ cfg_value_weight }}" min="0" max="1">
+              <div class="param-label">Trend Wt</div>
+              <input type="number" name="trend_weight" class="param-input" step="0.05"
+                     value="{{ cfg_trend_weight }}" min="0" max="1">
+            </div>
+            <div class="col-4 col-md-2">
+              <div class="param-label">Volume Wt</div>
+              <input type="number" name="volume_weight" class="param-input" step="0.05"
+                     value="{{ cfg_volume_weight }}" min="0" max="1">
             </div>
             <div class="col-4 col-md-2">
               <div class="param-label">F-Score Wt</div>
