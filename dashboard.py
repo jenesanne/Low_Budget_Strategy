@@ -19,7 +19,7 @@ import os
 import secrets
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -124,15 +124,26 @@ def _last_rebalance_log():
 
 
 def _next_rebalance():
-    """Calculate the next monthly rebalance date."""
+    """Calculate the next rebalance date (weekly or monthly per config)."""
     now = datetime.now(timezone.utc)
-    # Try current month first
+    freq = getattr(config, "REBALANCE_FREQUENCY", "monthly").lower()
+
+    if freq == "weekly":
+        target_weekday = getattr(config, "REBALANCE_WEEKDAY", 0)  # Mon=0
+        days_ahead = (target_weekday - now.weekday()) % 7
+        candidate = datetime(
+            now.year, now.month, now.day, 14, 30, tzinfo=timezone.utc
+        ) + timedelta(days=days_ahead)
+        if candidate <= now:
+            candidate += timedelta(days=7)
+        return candidate
+
+    # monthly (default)
     candidate = datetime(
         now.year, now.month, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc
     )
     if candidate > now:
         return candidate
-    # Next month
     if now.month == 12:
         return datetime(
             now.year + 1, 1, config.REBALANCE_DAY, 14, 30, tzinfo=timezone.utc
@@ -279,6 +290,96 @@ def api_equity_history():
         if data:
             return jsonify(data)
         return jsonify({"error": "no data"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/account")
+def api_account():
+    """Account + strategy-level metrics (JSON)."""
+    if _requires_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        account = _get_account()
+        positions = _get_positions()
+        capital = config.INITIAL_CAPITAL
+        total_market_value = sum(float(p.market_value) for p in positions)
+        total_unrealized_pl = sum(float(p.unrealized_pl) for p in positions)
+        strategy_value = capital + total_unrealized_pl
+        strategy_cash = capital - total_market_value + total_unrealized_pl
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)
+        day_pnl = equity - last_equity
+        return jsonify(
+            {
+                "strategy_value": round(strategy_value, 2),
+                "strategy_cash": round(strategy_cash, 2),
+                "capital": capital,
+                "total_unrealized_pl": round(total_unrealized_pl, 2),
+                "day_pnl": round(day_pnl, 2),
+                "day_pnl_pct": round(day_pnl / capital * 100, 2) if capital else 0,
+                "num_positions": len(positions),
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/positions")
+def api_positions():
+    """Current Alpaca positions (JSON)."""
+    if _requires_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        positions = _get_positions()
+        pos_data = []
+        for p in positions:
+            pos_data.append(
+                {
+                    "symbol": p.symbol,
+                    "qty": float(p.qty),
+                    "avg_entry": float(p.avg_entry_price),
+                    "current_price": float(p.current_price),
+                    "market_value": float(p.market_value),
+                    "unrealized_pl": float(p.unrealized_pl),
+                    "unrealized_pl_pct": float(p.unrealized_plpc) * 100,
+                    "side": p.side,
+                }
+            )
+        pos_data.sort(key=lambda x: x["unrealized_pl"], reverse=True)
+        return jsonify(pos_data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/orders")
+def api_orders():
+    """Recent Alpaca orders (JSON)."""
+    if _requires_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        orders = _get_orders(limit=15)
+        order_data = []
+        for o in orders:
+            filled_at = ""
+            if o.filled_at:
+                filled_at = o.filled_at.strftime("%Y-%m-%d %H:%M")
+            elif o.submitted_at:
+                filled_at = o.submitted_at.strftime("%Y-%m-%d %H:%M")
+            order_data.append(
+                {
+                    "symbol": o.symbol,
+                    "side": o.side.value if hasattr(o.side, "value") else str(o.side),
+                    "qty": str(o.qty or o.notional or ""),
+                    "filled_qty": str(o.filled_qty or "0"),
+                    "status": (
+                        o.status.value if hasattr(o.status, "value") else str(o.status)
+                    ),
+                    "time": filled_at,
+                    "filled_avg_price": str(o.filled_avg_price or ""),
+                }
+            )
+        return jsonify(order_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

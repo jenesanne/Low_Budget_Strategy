@@ -27,9 +27,23 @@ INITIAL_CAPITAL = 1000  # Starting capital in USD
 MAX_POSITIONS = 10  # Diversified enough to reduce blowup risk
 MIN_POSITION_SIZE = 50  # Minimum position in USD (below this, skip)
 MAX_POSITION_PCT = 0.15  # Max 15% in any single stock at entry
-REBALANCE_DAY = 1  # Day of month to rebalance (1 = first trading day)
-REBALANCE_FREQUENCY = "monthly"  # Monthly rebalance + daily slot-refill after stop-outs
+REBALANCE_DAY = (
+    1  # Day of month to rebalance (used when REBALANCE_FREQUENCY = "monthly")
+)
+REBALANCE_WEEKDAY = (
+    0  # Day of week to rebalance (Mon=0..Fri=4) — used when frequency = "weekly"
+)
+REBALANCE_FREQUENCY = (
+    "monthly"  # "monthly" (best risk-adjusted in backtest), "weekly", or "quarterly"
+)
 REBALANCE_THRESHOLD_PCT = 0.25  # Skip rebalance if position within 25% of target
+
+# ── Asymmetric Cut-Losers / Let-Winners-Run (DISABLED) ────────────────────
+# Set to a float to enable. Backtest showed tighter cuts hurt overall return
+# (whipsaws on normal pullbacks). ATR trailing stop already handles real breakdowns.
+CUT_LOSER_PCT = None  # e.g. -0.15 to force-sell positions down ≥15%
+KEEP_WINNER_PCT = None  # e.g. 0.10 to hold winners up ≥10% even if dropped from target
+# Trailing-stop logic in backtester/risk_management still applies on top of this.
 
 # ── Stock Universe Filters ──────────────────────────────────────────────────
 MIN_MARKET_CAP = 10_000_000  # $10M minimum market cap

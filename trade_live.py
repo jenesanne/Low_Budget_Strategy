@@ -136,6 +136,25 @@ def rebalance():
     # 4. Current positions ----------------------------------------------------
     positions = client.get_all_positions()
     current = {p.symbol: float(p.qty) for p in positions}
+    # Unrealized P&L pct per symbol (Alpaca reports as decimal, e.g. -0.08 = -8%)
+    pnl_pct = {p.symbol: float(p.unrealized_plpc) for p in positions}
+
+    # 4a. Asymmetric cut-losers / let-winners-run -----------------------------
+    cut_threshold = getattr(config, "CUT_LOSER_PCT", -0.08)
+    keep_threshold = getattr(config, "KEEP_WINNER_PCT", 0.05)
+    forced_sells: dict[str, float] = {}  # symbol -> qty (full liquidation)
+    protected_winners: set[str] = set()  # held even if not in target list
+
+    for sym, qty in current.items():
+        pnl = pnl_pct.get(sym, 0.0)
+        if pnl <= cut_threshold:
+            forced_sells[sym] = qty
+            logger.info(f"CUT LOSER: {sym} P&L {pnl:+.1%} <= {cut_threshold:+.1%}")
+        elif pnl >= keep_threshold:
+            protected_winners.add(sym)
+            logger.info(
+                f"LET WINNER RUN: {sym} P&L {pnl:+.1%} >= {keep_threshold:+.1%}"
+            )
 
     # 5. Calculate target shares (equal-weight, fractional) -------------------
     target_value = capital / len(target_tickers)
@@ -155,15 +174,27 @@ def rebalance():
     sells = []
     buys = []
 
-    # Sell positions no longer in target
+    # Forced sells (losers) — always liquidate, removes from any further consideration
+    for ticker, qty in forced_sells.items():
+        sells.append((ticker, OrderSide.SELL, qty))
+        targets.pop(ticker, None)
+
+    # Sell positions no longer in target — UNLESS they're protected winners
     for ticker, qty in current.items():
-        if ticker not in targets:
+        if ticker in forced_sells:
+            continue
+        if ticker not in targets and ticker not in protected_winners:
             sells.append((ticker, OrderSide.SELL, qty))
 
     # Rebalance existing + open new
     for ticker, target_qty in targets.items():
+        if ticker in forced_sells:
+            continue
         held = current.get(ticker, 0.0)
         delta = target_qty - held
+        # Don't trim winners — only allow scale-ups for protected winners
+        if ticker in protected_winners and delta < 0:
+            continue
         threshold = held * config.REBALANCE_THRESHOLD_PCT if held > 0 else 0
         if abs(delta) <= threshold:
             continue

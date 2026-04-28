@@ -134,11 +134,16 @@ def run_backtest(
     prices = prices.sort_index()
     trading_days = prices.index
 
-    # Determine quarterly rebalance months (Mar, Jun, Sep, Dec)
-    rebal_freq = getattr(config, "REBALANCE_FREQUENCY", "monthly")
+    # Rebalance schedule: weekly | monthly | quarterly
+    rebal_freq = getattr(config, "REBALANCE_FREQUENCY", "monthly").lower()
     rebal_months = {3, 6, 9, 12} if rebal_freq == "quarterly" else set(range(1, 13))
     rebal_day = getattr(config, "REBALANCE_DAY", 1)
+    rebal_weekday = getattr(config, "REBALANCE_WEEKDAY", 0)  # Mon=0..Fri=4
     trailing_stop = getattr(config, "TRAILING_STOP", True)
+
+    # Asymmetric cut-losers / let-winners-run thresholds
+    cut_loser_pct = getattr(config, "CUT_LOSER_PCT", None)
+    keep_winner_pct = getattr(config, "KEEP_WINNER_PCT", None)
 
     capital = initial_capital
     # holdings: {ticker: {"shares": float, "cost_basis": float, "high_water": float}}
@@ -161,6 +166,24 @@ def run_backtest(
         return value
 
     def is_rebalance_day(dt):
+        if rebal_freq == "weekly":
+            # First trading day of ISO week whose weekday >= rebal_weekday
+            if dt.weekday() != rebal_weekday:
+                # If target weekday isn't a trading day this week, fall back to first trading day on/after it
+                week_days = trading_days[
+                    (
+                        trading_days.to_series().dt.isocalendar().week
+                        == dt.isocalendar().week
+                    )
+                    & (trading_days.year == dt.year)
+                ]
+                if len(week_days) == 0:
+                    return False
+                eligible = week_days[week_days.weekday >= rebal_weekday]
+                target = eligible[0] if len(eligible) > 0 else week_days[0]
+                return dt == target
+            return True
+
         if dt.month not in rebal_months:
             return False
         month_days = trading_days[
@@ -474,9 +497,54 @@ def run_backtest(
                             o["ticker"] for o in pending_orders if o["shares"] < 0
                         }
 
-                        # Sell positions no longer in target
+                        # ── Asymmetric cut-losers / let-winners-run ──
+                        # Compute unrealized P&L pct for each holding
+                        forced_sells: set = set()
+                        protected_winners: set = set()
+                        if cut_loser_pct is not None or keep_winner_pct is not None:
+                            for tkr, pos in holdings.items():
+                                if tkr not in current_prices.index or np.isnan(
+                                    current_prices[tkr]
+                                ):
+                                    continue
+                                price = float(current_prices[tkr])
+                                pnl = (price - pos["cost_basis"]) / pos["cost_basis"]
+                                if cut_loser_pct is not None and pnl <= cut_loser_pct:
+                                    forced_sells.add(tkr)
+                                elif (
+                                    keep_winner_pct is not None
+                                    and pnl >= keep_winner_pct
+                                ):
+                                    protected_winners.add(tkr)
+
+                        if forced_sells:
+                            logger.info(
+                                f"{dt.date()}: CUT LOSERS {sorted(forced_sells)}"
+                            )
+                        if protected_winners:
+                            logger.info(
+                                f"{dt.date()}: KEEP WINNERS {sorted(protected_winners)}"
+                            )
+
+                        # Force-sell losers regardless of target list
+                        for ticker in forced_sells:
+                            if ticker in pending_sell_tickers:
+                                continue
+                            pending_orders.append(
+                                {
+                                    "ticker": ticker,
+                                    "shares": -holdings[ticker]["shares"],
+                                    "created_dt": dt,
+                                }
+                            )
+
+                        # Sell positions no longer in target — UNLESS protected winner
                         for ticker in current_tickers - target_tickers:
                             if ticker in pending_sell_tickers:
+                                continue
+                            if ticker in forced_sells:
+                                continue
+                            if ticker in protected_winners:
                                 continue
                             if ticker in holdings:
                                 pending_orders.append(
@@ -494,6 +562,8 @@ def run_backtest(
                         )
 
                         for ticker in target_tickers:
+                            if ticker in forced_sells:
+                                continue
                             if ticker not in current_prices.index or np.isnan(
                                 current_prices[ticker]
                             ):
@@ -508,6 +578,10 @@ def run_backtest(
                             current_val = current_shares * price
                             target_val = target_weight * total_val
                             diff = target_val - current_val
+
+                            # Don't trim winners — only allow scale-ups
+                            if ticker in protected_winners and diff < 0:
+                                continue
 
                             rebal_threshold = getattr(
                                 config, "REBALANCE_THRESHOLD_PCT", 0.0

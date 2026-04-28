@@ -38,10 +38,13 @@ fi
 
 echo "=== 5. Set up cron ==="
 # Monthly rebalance: 1st of every month at 14:30 UTC (after US market open)
-CRON_CMD="30 14 1 * * cd $PROJECT_DIR && $VENV/bin/python trade_live.py --execute >> $LOG 2>&1"
+REBAL_CMD="30 14 1 * * cd $PROJECT_DIR && $VENV/bin/python trade_live.py --execute >> $LOG 2>&1"
+# Daily stop-loss monitor: every weekday at 21:05 UTC (~15 min after US close)
+STOPS_CMD="5 21 * * 1-5 cd $PROJECT_DIR && $VENV/bin/python monitor_stops.py --execute >> $LOG 2>&1"
 
-# Remove existing strategy cron entries, then add
-(crontab -l 2>/dev/null | grep -v "trade_live.py" || true; echo "$CRON_CMD") | crontab -
+# Remove existing strategy cron entries, then add both
+(crontab -l 2>/dev/null | grep -v -E "trade_live.py|monitor_stops.py" || true; \
+    echo "$REBAL_CMD"; echo "$STOPS_CMD") | crontab -
 
 echo "=== 6. Create log file ==="
 touch "$LOG"
